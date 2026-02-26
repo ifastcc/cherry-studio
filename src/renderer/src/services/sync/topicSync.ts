@@ -23,17 +23,31 @@ const logger = loggerService.withContext('TopicSync')
 const SYNC_INTERVAL = 30_000 // 30 秒
 const BATCH_SIZE = 20 // 批量上传时每批最大数量
 const INIT_DELAY = 8_000 // 初始化延迟（等 Dexie + Redux persist 准备好）
+const REQUEST_TIMEOUT = 15_000
+const CONFIG_CACHE_TTL = 30_000
 
 let cachedServer: string | null = null
 let cachedToken: string | null = null
+let cachedConfigAt = 0
+let cachedLocalOverrides = ''
 
 async function getConfig() {
-  if (cachedServer !== null && cachedToken !== null) {
+  const localServer = localStorage.getItem('cherry-sync-server') || ''
+  const localToken = localStorage.getItem('cherry-sync-token') || ''
+  const localOverrides = `${localServer}|${localToken}`
+  const now = Date.now()
+
+  if (
+    cachedServer !== null &&
+    cachedToken !== null &&
+    cachedLocalOverrides === localOverrides &&
+    now - cachedConfigAt < CONFIG_CACHE_TTL
+  ) {
     return { server: cachedServer, token: cachedToken }
   }
 
-  let server = localStorage.getItem('cherry-sync-server') || import.meta.env.RENDERER_VITE_SYNC_SERVER || ''
-  let token = localStorage.getItem('cherry-sync-token') || import.meta.env.RENDERER_VITE_SYNC_TOKEN || ''
+  let server = localServer || import.meta.env.RENDERER_VITE_SYNC_SERVER || ''
+  let token = localToken || import.meta.env.RENDERER_VITE_SYNC_TOKEN || ''
 
   try {
     // 尝试读取本地配置文件 (支持极低侵入的分发模式)
@@ -57,6 +71,8 @@ async function getConfig() {
 
   cachedServer = server.replace(/\/+$/, '')
   cachedToken = token
+  cachedConfigAt = now
+  cachedLocalOverrides = localOverrides
 
   return { server: cachedServer, token: cachedToken }
 }
@@ -81,14 +97,29 @@ interface TopicFullData {
   }>
 }
 
+type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'not_found' | 'error'
+
+interface SyncActionResult {
+  ok: boolean
+  topicId: string
+  status: SyncActionStatus
+  seq?: number
+  revision?: number
+  error?: string
+}
+
 // ── 状态 ──────────────────────────────────────────────────────────────
 
-const SNAPSHOT_KEY = 'cherry-sync-snapshot' // localStorage key for persisted snapshot
+const SNAPSHOT_KEY_PREFIX = 'cherry-sync-snapshot:' // localStorage key prefix for persisted snapshot
+
+function snapshotStorageKey(server: string): string {
+  return `${SNAPSHOT_KEY_PREFIX}${server || 'default'}`
+}
 
 /** 从 localStorage 恢复上次的快照（App 重启后不丢失） */
-function loadPersistedSnapshot(): Map<string, string> {
+function loadPersistedSnapshot(server: string): Map<string, string> {
   try {
-    const raw = localStorage.getItem(SNAPSHOT_KEY)
+    const raw = localStorage.getItem(snapshotStorageKey(server))
     if (!raw) return new Map()
     const entries: [string, string][] = JSON.parse(raw)
     return new Map(entries)
@@ -98,15 +129,18 @@ function loadPersistedSnapshot(): Map<string, string> {
 }
 
 /** 将快照持久化到 localStorage */
-function savePersistedSnapshot(snapshot: Map<string, string>) {
+function savePersistedSnapshot(server: string, snapshot: Map<string, string>) {
   try {
-    localStorage.setItem(SNAPSHOT_KEY, JSON.stringify([...snapshot.entries()]))
+    localStorage.setItem(snapshotStorageKey(server), JSON.stringify([...snapshot.entries()]))
   } catch {
     // localStorage 满了之类的极端情况，忽略
   }
 }
 
 let previousSnapshot: Map<string, string> | null = null // null = 尚未初始化
+let previousSnapshotServer: string | null = null
+let isSyncRunning = false
+const TERMINAL_STATUSES = new Set<SyncActionStatus>(['applied', 'noop', 'stale', 'not_found'])
 
 import store from '@renderer/store'
 
@@ -217,46 +251,210 @@ async function getTopicFullData(topicId: string): Promise<TopicFullData | null> 
 
 // ── HTTP 工具 ─────────────────────────────────────────────────────────
 
-async function apiPost(path: string, body: unknown): Promise<boolean> {
-  const { server, token } = await getConfig()
-  if (!server) return false
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT)
   try {
-    const resp = await fetch(`${server}${path}`, {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function toSyncActionResult(
+  fallbackTopicId: string,
+  payload: unknown,
+  fallbackError = 'invalid_response'
+): SyncActionResult {
+  if (!payload || typeof payload !== 'object') {
+    return { ok: false, topicId: fallbackTopicId, status: 'error', error: fallbackError }
+  }
+
+  const item = payload as Record<string, unknown>
+  const statusRaw = typeof item.status === 'string' ? item.status : 'error'
+  const status = (['applied', 'noop', 'stale', 'not_found', 'error'].includes(statusRaw)
+    ? statusRaw
+    : 'error') as SyncActionStatus
+
+  return {
+    ok: item.ok === true || status !== 'error',
+    topicId: (item.topicId as string) || fallbackTopicId,
+    status,
+    seq: typeof item.seq === 'number' ? item.seq : undefined,
+    revision: typeof item.revision === 'number' ? item.revision : undefined,
+    error: typeof item.error === 'string' ? item.error : undefined
+  }
+}
+
+async function apiPostTopic(topic: TopicFullData): Promise<SyncActionResult> {
+  const { server, token } = await getConfig()
+  if (!server) return { ok: false, topicId: topic.topicId, status: 'error', error: 'missing_server' }
+  try {
+    const resp = await fetchWithTimeout(`${server}/api/topics`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(topic)
     })
+    const text = await resp.text()
+    let decoded: unknown = null
+    try {
+      decoded = text ? JSON.parse(text) : null
+    } catch (_) {}
+
     if (!resp.ok) {
-      logger.error(`POST ${path} failed: ${resp.status} ${await resp.text()}`)
-      return false
+      logger.error(`POST /api/topics failed: ${resp.status} ${text}`)
+      return { ok: false, topicId: topic.topicId, status: 'error', error: `http_${resp.status}` }
     }
-    return true
+
+    return toSyncActionResult(topic.topicId, decoded)
   } catch (e) {
-    logger.error(`POST ${path} network error`, e instanceof Error ? e : new Error(String(e)))
-    return false
+    logger.error('POST /api/topics network error', e instanceof Error ? e : new Error(String(e)))
+    return { ok: false, topicId: topic.topicId, status: 'error', error: 'network_error' }
   }
 }
 
-async function apiDelete(path: string): Promise<boolean> {
+async function apiPostBatch(topics: TopicFullData[]): Promise<Map<string, SyncActionResult>> {
   const { server, token } = await getConfig()
-  if (!server) return false
-  try {
-    const resp = await fetch(`${server}${path}`, {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` }
-    })
-    if (!resp.ok) {
-      logger.error(`DELETE ${path} failed: ${resp.status}`)
-      return false
+  const out = new Map<string, SyncActionResult>()
+
+  if (!server) {
+    for (const topic of topics) {
+      out.set(topic.topicId, {
+        ok: false,
+        topicId: topic.topicId,
+        status: 'error',
+        error: 'missing_server'
+      })
     }
-    return true
-  } catch (e) {
-    logger.error(`DELETE ${path} network error`, e instanceof Error ? e : new Error(String(e)))
-    return false
+    return out
   }
+
+  try {
+    const resp = await fetchWithTimeout(`${server}/api/topics/batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ topics })
+    })
+
+    const text = await resp.text()
+    let decoded: unknown = null
+    try {
+      decoded = text ? JSON.parse(text) : null
+    } catch (_) {}
+
+    if (!resp.ok) {
+      logger.error(`POST /api/topics/batch failed: ${resp.status} ${text}`)
+      for (const topic of topics) {
+        out.set(topic.topicId, {
+          ok: false,
+          topicId: topic.topicId,
+          status: 'error',
+          error: `http_${resp.status}`
+        })
+      }
+      return out
+    }
+
+    const results =
+      decoded &&
+      typeof decoded === 'object' &&
+      Array.isArray((decoded as Record<string, unknown>).results)
+        ? ((decoded as Record<string, unknown>).results as unknown[])
+        : []
+
+    for (const topic of topics) {
+      out.set(topic.topicId, {
+        ok: false,
+        topicId: topic.topicId,
+        status: 'error',
+        error: 'missing_result'
+      })
+    }
+
+    for (const item of results) {
+      const topicId = (item as Record<string, unknown>)?.topicId
+      if (typeof topicId !== 'string' || !topicId) continue
+      out.set(topicId, toSyncActionResult(topicId, item))
+    }
+  } catch (e) {
+    logger.error('POST /api/topics/batch network error', e instanceof Error ? e : new Error(String(e)))
+    for (const topic of topics) {
+      out.set(topic.topicId, {
+        ok: false,
+        topicId: topic.topicId,
+        status: 'error',
+        error: 'network_error'
+      })
+    }
+  }
+
+  return out
+}
+
+async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActionResult>> {
+  const { server, token } = await getConfig()
+  const out = new Map<string, SyncActionResult>()
+  if (!server) {
+    for (const topicId of topicIds) {
+      out.set(topicId, { ok: false, topicId, status: 'error', error: 'missing_server' })
+    }
+    return out
+  }
+
+  try {
+    const resp = await fetchWithTimeout(`${server}/api/topics/delete-batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ topicIds })
+    })
+
+    const text = await resp.text()
+    let decoded: unknown = null
+    try {
+      decoded = text ? JSON.parse(text) : null
+    } catch (_) {}
+
+    if (!resp.ok) {
+      logger.error(`POST /api/topics/delete-batch failed: ${resp.status} ${text}`)
+      for (const topicId of topicIds) {
+        out.set(topicId, { ok: false, topicId, status: 'error', error: `http_${resp.status}` })
+      }
+      return out
+    }
+
+    const results =
+      decoded &&
+      typeof decoded === 'object' &&
+      Array.isArray((decoded as Record<string, unknown>).results)
+        ? ((decoded as Record<string, unknown>).results as unknown[])
+        : []
+
+    for (const topicId of topicIds) {
+      out.set(topicId, { ok: false, topicId, status: 'error', error: 'missing_result' })
+    }
+
+    for (const item of results) {
+      const topicId = (item as Record<string, unknown>)?.topicId
+      if (typeof topicId !== 'string' || !topicId) continue
+      out.set(topicId, toSyncActionResult(topicId, item))
+    }
+  } catch (e) {
+    logger.error('POST /api/topics/delete-batch network error', e instanceof Error ? e : new Error(String(e)))
+    for (const topicId of topicIds) {
+      out.set(topicId, { ok: false, topicId, status: 'error', error: 'network_error' })
+    }
+  }
+
+  return out
 }
 
 let syncTimeout: ReturnType<typeof setTimeout> | null = null
@@ -267,13 +465,16 @@ let lastAssistantsState: unknown = null
 async function syncOnce(): Promise<void> {
   const { server } = await getConfig()
   if (!server) return // 未配置同步服务器，静默跳过
+  if (isSyncRunning) return
+  isSyncRunning = true
 
   try {
     const currentSnapshot = getTopicSnapshotFromStore()
 
     // 首次运行：从 localStorage 恢复快照（可能为空）
-    if (previousSnapshot === null) {
-      previousSnapshot = loadPersistedSnapshot()
+    if (previousSnapshot === null || previousSnapshotServer !== server) {
+      previousSnapshot = loadPersistedSnapshot(server)
+      previousSnapshotServer = server
       logger.info(
         `Initialized: ${currentSnapshot.size} local topics, ` + `${previousSnapshot.size} in last synced snapshot`
       )
@@ -306,6 +507,11 @@ async function syncOnce(): Promise<void> {
     }
 
     logger.info(`Changes: +${added.length} ~${updated.length} -${deleted.length}`)
+    const nextSnapshot = new Map(previousSnapshot)
+    let appliedCount = 0
+    let noopCount = 0
+    let staleCount = 0
+    let failedCount = 0
 
     // 处理新增 + 更新：获取完整数据并上传
     const toUpload = [...added, ...updated]
@@ -321,23 +527,64 @@ async function syncOnce(): Promise<void> {
         }
 
         if (topicsData.length === 1) {
-          await apiPost('/api/topics', topicsData[0])
+          const one = topicsData[0]
+          const result = await apiPostTopic(one)
+          if (TERMINAL_STATUSES.has(result.status)) {
+            const marker = currentSnapshot.get(one.topicId)
+            if (marker !== undefined) nextSnapshot.set(one.topicId, marker)
+          }
+          if (result.status === 'applied') appliedCount++
+          else if (result.status === 'noop' || result.status === 'not_found') noopCount++
+          else if (result.status === 'stale') staleCount++
+          else failedCount++
         } else if (topicsData.length > 1) {
-          await apiPost('/api/topics/batch', { topics: topicsData })
+          const results = await apiPostBatch(topicsData)
+          for (const topic of topicsData) {
+            const result = results.get(topic.topicId)
+            if (result && TERMINAL_STATUSES.has(result.status)) {
+              const marker = currentSnapshot.get(topic.topicId)
+              if (marker !== undefined) nextSnapshot.set(topic.topicId, marker)
+            }
+
+            const status = result?.status ?? 'error'
+            if (status === 'applied') appliedCount++
+            else if (status === 'noop' || status === 'not_found') noopCount++
+            else if (status === 'stale') staleCount++
+            else failedCount++
+          }
         }
       }
     }
 
     // 处理删除
-    for (const id of deleted) {
-      await apiDelete(`/api/topics/${id}`)
+    for (let i = 0; i < deleted.length; i += BATCH_SIZE) {
+      const batch = deleted.slice(i, i + BATCH_SIZE)
+      const results = await apiDeleteBatch(batch)
+      for (const id of batch) {
+        const result = results.get(id)
+        if (result && TERMINAL_STATUSES.has(result.status)) {
+          nextSnapshot.delete(id)
+        }
+
+        const status = result?.status ?? 'error'
+        if (status === 'applied') appliedCount++
+        else if (status === 'noop' || status === 'not_found') noopCount++
+        else if (status === 'stale') staleCount++
+        else failedCount++
+      }
     }
 
+    logger.info(
+      `Sync result: applied=${appliedCount}, noop=${noopCount}, stale=${staleCount}, failed=${failedCount}`
+    )
+
     // 更新快照（内存 + 持久化）
-    previousSnapshot = currentSnapshot
-    savePersistedSnapshot(currentSnapshot)
+    previousSnapshot = nextSnapshot
+    savePersistedSnapshot(server, nextSnapshot)
   } catch (e) {
     logger.error('Sync loop error', e instanceof Error ? e : new Error(String(e)))
+  } finally {
+    isSyncRunning = false
   }
 }
 
