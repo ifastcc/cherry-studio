@@ -460,6 +460,40 @@ async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActio
 let syncTimeout: ReturnType<typeof setTimeout> | null = null
 let lastAssistantsState: unknown = null
 
+function logSyncResult({
+  added,
+  updated,
+  deleted,
+  applied,
+  noop,
+  stale,
+  failed
+}: {
+  added: number
+  updated: number
+  deleted: number
+  applied: number
+  noop: number
+  stale: number
+  failed: number
+}) {
+  const message =
+    `Sync completed: +${added} ~${updated} -${deleted}; ` +
+    `applied=${applied}, noop=${noop}, stale=${stale}, failed=${failed}`
+
+  if (failed > 0) {
+    logger.warn(message, { logToMain: true })
+    return
+  }
+
+  if (applied > 0) {
+    logger.info(message)
+    return
+  }
+
+  logger.verbose(message)
+}
+
 // ── 同步主循环 ────────────────────────────────────────────────────────
 
 async function syncOnce(): Promise<void> {
@@ -506,7 +540,6 @@ async function syncOnce(): Promise<void> {
       return // 无变更
     }
 
-    logger.info(`Changes: +${added.length} ~${updated.length} -${deleted.length}`)
     const nextSnapshot = new Map(previousSnapshot)
     let appliedCount = 0
     let noopCount = 0
@@ -574,9 +607,15 @@ async function syncOnce(): Promise<void> {
       }
     }
 
-    logger.info(
-      `Sync result: applied=${appliedCount}, noop=${noopCount}, stale=${staleCount}, failed=${failedCount}`
-    )
+    logSyncResult({
+      added: added.length,
+      updated: updated.length,
+      deleted: deleted.length,
+      applied: appliedCount,
+      noop: noopCount,
+      stale: staleCount,
+      failed: failedCount
+    })
 
     // 更新快照（内存 + 持久化）
     previousSnapshot = nextSnapshot
