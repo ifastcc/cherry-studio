@@ -17,6 +17,7 @@ import { loggerService } from '@logger'
 import db from '@renderer/databases'
 import store from '@renderer/store'
 import { updateAssistants } from '@renderer/store/assistants'
+import { MessageBlockStatus } from '@renderer/types/newMessage'
 import type { Topic } from '@renderer/types'
 import type { Message as NewMessage, MessageBlock } from '@renderer/types/newMessage'
 
@@ -148,8 +149,8 @@ interface PullPlanItem {
   reason?: PullConflictItem['reason']
 }
 
-let cachedServer: string | null = null
-let cachedToken: string | null = null
+let cachedServer = ''
+let cachedToken = ''
 let cachedSource: ConfigSource = 'none'
 let cachedConfigAt = 0
 let cachedLocalOverrides = ''
@@ -354,15 +355,14 @@ async function refreshConnectivity(force = false): Promise<ConnectivityProbeResu
   return probe
 }
 
-async function getConfig() {
+async function getConfig(): Promise<{ server: string; token: string; source: ConfigSource }> {
   const localServer = localStorage.getItem(SYNC_SERVER_KEY) || ''
   const localToken = localStorage.getItem(SYNC_TOKEN_KEY) || ''
   const localOverrides = `${localServer}|${localToken}`
   const now = Date.now()
 
   if (
-    cachedServer !== null &&
-    cachedToken !== null &&
+    cachedConfigAt > 0 &&
     cachedLocalOverrides === localOverrides &&
     now - cachedConfigAt < CONFIG_CACHE_TTL
   ) {
@@ -812,6 +812,20 @@ function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function toMessageBlockStatus(value: unknown): MessageBlockStatus {
+  if (
+    value === MessageBlockStatus.PENDING ||
+    value === MessageBlockStatus.PROCESSING ||
+    value === MessageBlockStatus.STREAMING ||
+    value === MessageBlockStatus.SUCCESS ||
+    value === MessageBlockStatus.ERROR ||
+    value === MessageBlockStatus.PAUSED
+  ) {
+    return value
+  }
+  return MessageBlockStatus.SUCCESS
+}
+
 function parseTimeMs(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) return value
   if (typeof value === 'string' && value.trim()) {
@@ -992,7 +1006,7 @@ function normalizeIncomingTopic(
 
   const blockMap = new Map<string, MessageBlock>()
   const messages: NewMessage[] = (Array.isArray(incoming.messages) ? incoming.messages : []).map((message, index) => {
-    const messageRecord = isRecord(message) ? message : {}
+    const messageRecord: Record<string, unknown> = isRecord(message) ? message : {}
     const messageId =
       typeof messageRecord.id === 'string' && messageRecord.id ? messageRecord.id : `${incoming.topicId}:msg:${index}`
     const role =
@@ -1005,16 +1019,19 @@ function normalizeIncomingTopic(
 
     for (const blockRaw of blocks) {
       if (!isRecord(blockRaw)) continue
+      const blockRecord: Record<string, unknown> = blockRaw
 
       const blockId =
-        typeof blockRaw.id === 'string' && blockRaw.id ? blockRaw.id : `${incoming.topicId}:${messageId}:block:${blockIds.length}`
+        typeof blockRecord.id === 'string' && blockRecord.id
+          ? blockRecord.id
+          : `${incoming.topicId}:${messageId}:block:${blockIds.length}`
 
       const block: MessageBlock = {
-        ...(blockRaw as MessageBlock),
+        ...(blockRecord as unknown as MessageBlock),
         id: blockId,
         messageId,
-        createdAt: typeof blockRaw.createdAt === 'string' ? blockRaw.createdAt : toIsoString(messageRecord.createdAt),
-        status: typeof blockRaw.status === 'string' ? blockRaw.status : 'success'
+        createdAt: typeof blockRecord.createdAt === 'string' ? blockRecord.createdAt : toIsoString(messageRecord.createdAt),
+        status: toMessageBlockStatus(blockRecord.status)
       }
 
       blockMap.set(blockId, block)
