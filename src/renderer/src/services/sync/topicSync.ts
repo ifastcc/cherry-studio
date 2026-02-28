@@ -15,6 +15,10 @@
  */
 import { loggerService } from '@logger'
 import db from '@renderer/databases'
+import store from '@renderer/store'
+import { updateAssistants } from '@renderer/store/assistants'
+import type { Topic } from '@renderer/types'
+import type { Message as NewMessage, MessageBlock } from '@renderer/types/newMessage'
 
 const logger = loggerService.withContext('TopicSync')
 
@@ -25,15 +29,334 @@ const BATCH_SIZE = 20 // 批量上传时每批最大数量
 const INIT_DELAY = 8_000 // 初始化延迟（等 Dexie + Redux persist 准备好）
 const REQUEST_TIMEOUT = 15_000
 const CONFIG_CACHE_TTL = 30_000
+const CONNECTIVITY_CACHE_TTL = 10_000
+const MAX_PULL_ITEMS = 1000
+const PULL_PAGE_LIMIT = 200
+const SYNC_SERVER_KEY = 'cherry-sync-server'
+const SYNC_TOKEN_KEY = 'cherry-sync-token'
+const SYNC_RUNTIME_KEY = 'cherry-sync-runtime'
+const SYNC_MODE_KEY = 'cherry-sync-mode'
+const SYNC_CONFLICT_POLICY_KEY = 'cherry-sync-conflict-policy'
+const PULL_CURSOR_KEY_PREFIX = 'cherry-sync-pull-cursor:'
+
+type ConfigSource = 'localStorage' | 'file' | 'env' | 'none'
+type ConnectionStatus = 'unknown' | 'online' | 'offline' | 'unauthorized'
+type SyncMode = 'push_only' | 'manual_pull' | 'auto_safe' | 'auto_full'
+type ConflictPolicy = 'local_wins' | 'server_wins'
+type PullConflictStrategy = 'stop' | ConflictPolicy
+
+interface PullConflictItem {
+  seq: number
+  topicId: string
+  op: 'upsert' | 'delete'
+  localUpdatedAt: number
+  remoteUpdatedAt: number
+  remoteClientUpdatedAt: number
+  reason: 'local_newer' | 'remote_timestamp_missing'
+}
+
+interface PullSummary {
+  total: number
+  safe: number
+  conflicts: number
+  applied: number
+  conflictResolvedLocal: number
+  conflictResolvedServer: number
+  writeBackQueued: number
+  nextCursor: number
+  blockedSeq: number | null
+}
+
+interface PullExecutionResult {
+  summary: PullSummary
+  pendingConflicts: PullConflictItem[]
+}
+
+interface SyncRuntimeResult {
+  added: number
+  updated: number
+  deleted: number
+  applied: number
+  noop: number
+  stale: number
+  failed: number
+}
+
+interface SyncRuntimeState {
+  configured: boolean
+  server: string
+  tokenConfigured: boolean
+  configSource: ConfigSource
+  syncMode: SyncMode
+  conflictPolicy: ConflictPolicy
+  pullCursor: number
+  connectionStatus: ConnectionStatus
+  running: boolean
+  lastCheckedAt: number | null
+  lastSyncAt: number | null
+  lastPullAt: number | null
+  lastHttpStatus: number | null
+  lastPullSummary: PullSummary | null
+  pendingConflicts: PullConflictItem[]
+  lastResult: SyncRuntimeResult | null
+  lastError: string | null
+}
+
+const DEFAULT_SYNC_RUNTIME_STATE: SyncRuntimeState = {
+  configured: false,
+  server: '',
+  tokenConfigured: false,
+  configSource: 'none',
+  syncMode: 'push_only',
+  conflictPolicy: 'local_wins',
+  pullCursor: 0,
+  connectionStatus: 'unknown',
+  running: false,
+  lastCheckedAt: null,
+  lastSyncAt: null,
+  lastPullAt: null,
+  lastHttpStatus: null,
+  lastPullSummary: null,
+  pendingConflicts: [],
+  lastResult: null,
+  lastError: null
+}
+
+interface ConnectivityProbeResult {
+  ok: boolean
+  status: ConnectionStatus
+  error: string | null
+  httpStatus: number | null
+}
+
+interface ServerChangeItem {
+  seq: number
+  topicId: string
+  op: 'upsert' | 'delete'
+  revision: number
+  updatedAt: number
+  clientUpdatedAt: number
+  topic?: TopicFullData
+}
+
+interface PullPlanItem {
+  item: ServerChangeItem
+  conflict: boolean
+  localUpdatedAt: number
+  remoteUpdatedAt: number
+  remoteClientUpdatedAt: number
+  reason?: PullConflictItem['reason']
+}
 
 let cachedServer: string | null = null
 let cachedToken: string | null = null
+let cachedSource: ConfigSource = 'none'
 let cachedConfigAt = 0
 let cachedLocalOverrides = ''
+let cachedConnectivityAt = 0
+let cachedConnectivityServer = ''
+let cachedConnectivityToken = ''
+let cachedConnectivityResult: ConnectivityProbeResult | null = null
+
+function getSyncRuntimeState(): SyncRuntimeState {
+  try {
+    const raw = localStorage.getItem(SYNC_RUNTIME_KEY)
+    if (!raw) return { ...DEFAULT_SYNC_RUNTIME_STATE }
+
+    const parsed = JSON.parse(raw) as Partial<SyncRuntimeState>
+    return {
+      ...DEFAULT_SYNC_RUNTIME_STATE,
+      ...parsed,
+      pendingConflicts: Array.isArray(parsed.pendingConflicts) ? [...parsed.pendingConflicts] : [],
+      lastPullSummary: parsed.lastPullSummary ? { ...parsed.lastPullSummary } : null,
+      lastResult: parsed.lastResult ? { ...parsed.lastResult } : null
+    }
+  } catch {
+    return { ...DEFAULT_SYNC_RUNTIME_STATE }
+  }
+}
+
+function updateSyncRuntimeState(patch: Partial<SyncRuntimeState>) {
+  try {
+    const nextState: SyncRuntimeState = {
+      ...getSyncRuntimeState(),
+      ...patch
+    }
+    localStorage.setItem(SYNC_RUNTIME_KEY, JSON.stringify(nextState))
+    window.dispatchEvent(new CustomEvent('cherry-sync-runtime', { detail: nextState }))
+  } catch {
+    // localStorage 不可用时忽略（不影响同步主流程）
+  }
+}
+
+function updateRuntimeConfig({
+  server,
+  token,
+  source
+}: {
+  server: string
+  token: string
+  source: ConfigSource
+}) {
+  const syncMode = getSyncMode()
+  const conflictPolicy = getConflictPolicy()
+  const pullCursor = server ? getPullCursor(server) : 0
+
+  updateSyncRuntimeState({
+    configured: Boolean(server),
+    server,
+    tokenConfigured: Boolean(token),
+    configSource: source,
+    syncMode,
+    conflictPolicy,
+    pullCursor
+  })
+}
+
+function isSyncMode(value: unknown): value is SyncMode {
+  return value === 'push_only' || value === 'manual_pull' || value === 'auto_safe' || value === 'auto_full'
+}
+
+function isConflictPolicy(value: unknown): value is ConflictPolicy {
+  return value === 'local_wins' || value === 'server_wins'
+}
+
+function getSyncMode(): SyncMode {
+  const raw = (localStorage.getItem(SYNC_MODE_KEY) || '').trim()
+  if (isSyncMode(raw)) {
+    return raw
+  }
+  return 'push_only'
+}
+
+function getConflictPolicy(): ConflictPolicy {
+  const raw = (localStorage.getItem(SYNC_CONFLICT_POLICY_KEY) || '').trim()
+  if (isConflictPolicy(raw)) return raw
+  return 'local_wins'
+}
+
+function getPullCursorKey(server: string): string {
+  return `${PULL_CURSOR_KEY_PREFIX}${server || 'default'}`
+}
+
+function getPullCursor(server: string): number {
+  const raw = localStorage.getItem(getPullCursorKey(server))
+  const parsed = Number.parseInt(raw || '0', 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+}
+
+function setPullCursor(server: string, cursor: number): void {
+  const safeCursor = Number.isFinite(cursor) && cursor >= 0 ? Math.floor(cursor) : 0
+  localStorage.setItem(getPullCursorKey(server), String(safeCursor))
+}
+
+function readConnectivityCache(server: string, token: string): ConnectivityProbeResult | null {
+  const now = Date.now()
+  const cacheValid =
+    cachedConnectivityResult &&
+    cachedConnectivityServer === server &&
+    cachedConnectivityToken === token &&
+    now - cachedConnectivityAt < CONNECTIVITY_CACHE_TTL
+
+  return cacheValid ? cachedConnectivityResult : null
+}
+
+function writeConnectivityCache(server: string, token: string, result: ConnectivityProbeResult) {
+  cachedConnectivityServer = server
+  cachedConnectivityToken = token
+  cachedConnectivityResult = result
+  cachedConnectivityAt = Date.now()
+}
+
+async function probeConnectivity(server: string, token: string, force = false): Promise<ConnectivityProbeResult> {
+  if (!server) {
+    return {
+      ok: false,
+      status: 'unknown',
+      error: null,
+      httpStatus: null
+    }
+  }
+
+  if (!force) {
+    const cached = readConnectivityCache(server, token)
+    if (cached) return cached
+  }
+
+  if (!token) {
+    const result: ConnectivityProbeResult = {
+      ok: false,
+      status: 'unauthorized',
+      error: 'missing_token',
+      httpStatus: null
+    }
+    writeConnectivityCache(server, token, result)
+    return result
+  }
+
+  try {
+    const resp = await fetchWithTimeout(`${server}/api/sync/changes?cursor=0&limit=1`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    })
+
+    if (resp.ok) {
+      const result: ConnectivityProbeResult = {
+        ok: true,
+        status: 'online',
+        error: null,
+        httpStatus: resp.status
+      }
+      writeConnectivityCache(server, token, result)
+      return result
+    }
+
+    const unauthorized = resp.status === 401 || resp.status === 403
+    const result: ConnectivityProbeResult = {
+      ok: false,
+      status: unauthorized ? 'unauthorized' : 'offline',
+      error: unauthorized ? 'unauthorized' : `http_${resp.status}`,
+      httpStatus: resp.status
+    }
+    writeConnectivityCache(server, token, result)
+    return result
+  } catch (error) {
+    const result: ConnectivityProbeResult = {
+      ok: false,
+      status: 'offline',
+      error: error instanceof Error ? error.message : 'network_error',
+      httpStatus: null
+    }
+    writeConnectivityCache(server, token, result)
+    return result
+  }
+}
+
+async function refreshConnectivity(force = false): Promise<ConnectivityProbeResult> {
+  const { server, token, source } = await getConfig()
+
+  updateRuntimeConfig({
+    server,
+    token,
+    source
+  })
+
+  const probe = await probeConnectivity(server, token, force)
+  updateSyncRuntimeState({
+    connectionStatus: probe.status,
+    lastCheckedAt: Date.now(),
+    lastHttpStatus: probe.httpStatus,
+    lastError: probe.ok ? null : probe.error
+  })
+
+  return probe
+}
 
 async function getConfig() {
-  const localServer = localStorage.getItem('cherry-sync-server') || ''
-  const localToken = localStorage.getItem('cherry-sync-token') || ''
+  const localServer = localStorage.getItem(SYNC_SERVER_KEY) || ''
+  const localToken = localStorage.getItem(SYNC_TOKEN_KEY) || ''
   const localOverrides = `${localServer}|${localToken}`
   const now = Date.now()
 
@@ -43,11 +366,17 @@ async function getConfig() {
     cachedLocalOverrides === localOverrides &&
     now - cachedConfigAt < CONFIG_CACHE_TTL
   ) {
-    return { server: cachedServer, token: cachedToken }
+    updateRuntimeConfig({
+      server: cachedServer,
+      token: cachedToken,
+      source: cachedSource
+    })
+    return { server: cachedServer, token: cachedToken, source: cachedSource }
   }
 
   let server = localServer || import.meta.env.RENDERER_VITE_SYNC_SERVER || ''
   let token = localToken || import.meta.env.RENDERER_VITE_SYNC_TOKEN || ''
+  let source: ConfigSource = localServer ? 'localStorage' : server ? 'env' : 'none'
 
   try {
     // 尝试读取本地配置文件 (支持极低侵入的分发模式)
@@ -57,10 +386,11 @@ async function getConfig() {
       const configText = await window.api.fs.readText(configPath).catch(() => null)
       if (configText) {
         const configJson = JSON.parse(configText)
-        if (configJson.server && !localStorage.getItem('cherry-sync-server')) {
+        if (configJson.server && !localStorage.getItem(SYNC_SERVER_KEY)) {
           server = configJson.server
+          source = 'file'
         }
-        if (configJson.token && !localStorage.getItem('cherry-sync-token')) {
+        if (configJson.token && !localStorage.getItem(SYNC_TOKEN_KEY)) {
           token = configJson.token
         }
       }
@@ -71,10 +401,20 @@ async function getConfig() {
 
   cachedServer = server.replace(/\/+$/, '')
   cachedToken = token
+  cachedSource = source
   cachedConfigAt = now
   cachedLocalOverrides = localOverrides
 
-  return { server: cachedServer, token: cachedToken }
+  // 配置发生变化时，失效连通性缓存
+  cachedConnectivityAt = 0
+
+  updateRuntimeConfig({
+    server: cachedServer,
+    token: cachedToken,
+    source: cachedSource
+  })
+
+  return { server: cachedServer, token: cachedToken, source: cachedSource }
 }
 
 interface TopicFullData {
@@ -97,7 +437,7 @@ interface TopicFullData {
   }>
 }
 
-type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'not_found' | 'error'
+type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'conflict' | 'not_found' | 'error'
 
 interface SyncActionResult {
   ok: boolean
@@ -140,9 +480,10 @@ function savePersistedSnapshot(server: string, snapshot: Map<string, string>) {
 let previousSnapshot: Map<string, string> | null = null // null = 尚未初始化
 let previousSnapshotServer: string | null = null
 let isSyncRunning = false
+let isPullRunning = false
+const forcedUpsertTopicIds = new Set<string>()
+const forcedDeleteTopicIds = new Set<string>()
 const TERMINAL_STATUSES = new Set<SyncActionStatus>(['applied', 'noop', 'stale', 'not_found'])
-
-import store from '@renderer/store'
 
 // ── 工具函数 ──────────────────────────────────────────────────────────
 
@@ -272,7 +613,7 @@ function toSyncActionResult(
 
   const item = payload as Record<string, unknown>
   const statusRaw = typeof item.status === 'string' ? item.status : 'error'
-  const status = (['applied', 'noop', 'stale', 'not_found', 'error'].includes(statusRaw)
+  const status = (['applied', 'noop', 'stale', 'conflict', 'not_found', 'error'].includes(statusRaw)
     ? statusRaw
     : 'error') as SyncActionStatus
 
@@ -286,16 +627,21 @@ function toSyncActionResult(
   }
 }
 
-async function apiPostTopic(topic: TopicFullData): Promise<SyncActionResult> {
+async function apiPostTopic(topic: TopicFullData, options?: { force?: boolean }): Promise<SyncActionResult> {
   const { server, token } = await getConfig()
   if (!server) return { ok: false, topicId: topic.topicId, status: 'error', error: 'missing_server' }
   try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    }
+    if (options?.force) {
+      headers['X-Sync-Force'] = '1'
+    }
+
     const resp = await fetchWithTimeout(`${server}/api/topics`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
-      },
+      headers,
       body: JSON.stringify(topic)
     })
     const text = await resp.text()
@@ -316,7 +662,7 @@ async function apiPostTopic(topic: TopicFullData): Promise<SyncActionResult> {
   }
 }
 
-async function apiPostBatch(topics: TopicFullData[]): Promise<Map<string, SyncActionResult>> {
+async function apiPostBatch(topics: TopicFullData[], options?: { force?: boolean }): Promise<Map<string, SyncActionResult>> {
   const { server, token } = await getConfig()
   const out = new Map<string, SyncActionResult>()
 
@@ -333,12 +679,17 @@ async function apiPostBatch(topics: TopicFullData[]): Promise<Map<string, SyncAc
   }
 
   try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    }
+    if (options?.force) {
+      headers['X-Sync-Force'] = '1'
+    }
+
     const resp = await fetchWithTimeout(`${server}/api/topics/batch`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
-      },
+      headers,
       body: JSON.stringify({ topics })
     })
 
@@ -457,8 +808,549 @@ async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActio
   return out
 }
 
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseTimeMs(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = new Date(value).getTime()
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+  return 0
+}
+
+function toIsoString(value: unknown): string {
+  const parsed = parseTimeMs(value)
+  if (parsed > 0) return new Date(parsed).toISOString()
+  return new Date().toISOString()
+}
+
+function parseServerChangeItem(raw: unknown): ServerChangeItem | null {
+  if (!isRecord(raw)) return null
+
+  const seq = Number(raw.seq || 0)
+  const topicId = typeof raw.topicId === 'string' ? raw.topicId : ''
+  const opRaw = raw.op
+  const op = opRaw === 'delete' ? 'delete' : opRaw === 'upsert' ? 'upsert' : null
+  if (!topicId || !op || !Number.isFinite(seq) || seq <= 0) return null
+
+  return {
+    seq,
+    topicId,
+    op,
+    revision: Number(raw.revision || 0),
+    updatedAt: Number(raw.updatedAt || 0),
+    clientUpdatedAt: Number(raw.clientUpdatedAt || 0),
+    topic: isRecord(raw.topic) ? (raw.topic as TopicFullData) : undefined
+  }
+}
+
+async function fetchServerChanges(
+  server: string,
+  token: string,
+  cursor: number
+): Promise<{ items: ServerChangeItem[]; nextCursor: number; hasMore: boolean }> {
+  const resp = await fetchWithTimeout(
+    `${server}/api/sync/changes?cursor=${cursor}&limit=${PULL_PAGE_LIMIT}&includePayload=1`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    }
+  )
+
+  const text = await resp.text()
+  let payload: unknown = null
+  try {
+    payload = text ? JSON.parse(text) : null
+  } catch {
+    payload = null
+  }
+
+  if (!resp.ok) {
+    throw new Error(`pull_http_${resp.status}`)
+  }
+
+  const root = isRecord(payload) ? payload : {}
+  const rawItems = Array.isArray(root.items) ? root.items : []
+  const items = rawItems.map(parseServerChangeItem).filter(Boolean) as ServerChangeItem[]
+  const nextCursor = Number(root.nextCursor ?? cursor)
+  const hasMore = root.hasMore === true
+
+  return {
+    items,
+    nextCursor: Number.isFinite(nextCursor) ? nextCursor : cursor,
+    hasMore
+  }
+}
+
+async function fetchAllServerChanges(
+  server: string,
+  token: string,
+  cursor: number
+): Promise<{ items: ServerChangeItem[]; nextCursor: number }> {
+  const items: ServerChangeItem[] = []
+  let currentCursor = cursor
+  let pages = 0
+
+  while (pages < 50 && items.length < MAX_PULL_ITEMS) {
+    const page = await fetchServerChanges(server, token, currentCursor)
+    pages += 1
+    items.push(...page.items)
+    currentCursor = page.nextCursor
+
+    if (!page.hasMore) break
+    if (page.items.length === 0) break
+  }
+
+  return {
+    items: items.slice(0, MAX_PULL_ITEMS),
+    nextCursor: currentCursor
+  }
+}
+
+function cloneAssistantsForUpdate(): any[] {
+  const assistants = store.getState().assistants?.assistants || []
+  return assistants.map((assistant: any) => ({
+    ...assistant,
+    topics: Array.isArray(assistant.topics) ? [...assistant.topics] : []
+  }))
+}
+
+function resolveAssistantId(assistants: any[], incoming: TopicFullData): string {
+  if (incoming.assistantId && assistants.some((assistant) => assistant.id === incoming.assistantId)) {
+    return incoming.assistantId
+  }
+
+  if (incoming.assistantName) {
+    const byName = assistants.find((assistant) => assistant.name === incoming.assistantName)
+    if (byName?.id) return byName.id
+  }
+
+  const defaultAssistantId = store.getState().assistants?.defaultAssistant?.id
+  if (defaultAssistantId) return defaultAssistantId
+  if (assistants[0]?.id) return assistants[0].id
+
+  return incoming.assistantId || 'default'
+}
+
+function upsertTopicMetaInAssistants(assistants: any[], assistantId: string, topicMeta: Topic): boolean {
+  let changed = false
+
+  for (const assistant of assistants) {
+    if (!Array.isArray(assistant.topics)) assistant.topics = []
+    if (assistant.id !== assistantId) {
+      const before = assistant.topics.length
+      assistant.topics = assistant.topics.filter((topic: any) => topic.id !== topicMeta.id)
+      if (assistant.topics.length !== before) changed = true
+    }
+  }
+
+  const target = assistants.find((assistant) => assistant.id === assistantId)
+  if (!target) return changed
+
+  const index = target.topics.findIndex((topic: any) => topic.id === topicMeta.id)
+  if (index >= 0) {
+    target.topics[index] = {
+      ...target.topics[index],
+      ...topicMeta,
+      messages: []
+    }
+    changed = true
+  } else {
+    target.topics.unshift({
+      ...topicMeta,
+      messages: []
+    })
+    changed = true
+  }
+
+  return changed
+}
+
+function removeTopicMetaFromAssistants(assistants: any[], topicId: string): boolean {
+  let changed = false
+  for (const assistant of assistants) {
+    if (!Array.isArray(assistant.topics)) continue
+    const before = assistant.topics.length
+    assistant.topics = assistant.topics.filter((topic: any) => topic.id !== topicId)
+    if (assistant.topics.length !== before) changed = true
+  }
+  return changed
+}
+
+function normalizeIncomingTopic(
+  incoming: TopicFullData,
+  assistantId: string
+): { topicMeta: Topic; messages: NewMessage[]; blocks: MessageBlock[] } {
+  const now = new Date().toISOString()
+  const createdAt = typeof incoming.createdAt === 'string' && incoming.createdAt ? incoming.createdAt : now
+  const updatedAt = typeof incoming.updatedAt === 'string' && incoming.updatedAt ? incoming.updatedAt : createdAt
+
+  const blockMap = new Map<string, MessageBlock>()
+  const messages: NewMessage[] = (Array.isArray(incoming.messages) ? incoming.messages : []).map((message, index) => {
+    const messageRecord = isRecord(message) ? message : {}
+    const messageId =
+      typeof messageRecord.id === 'string' && messageRecord.id ? messageRecord.id : `${incoming.topicId}:msg:${index}`
+    const role =
+      messageRecord.role === 'user' || messageRecord.role === 'assistant' || messageRecord.role === 'system'
+        ? messageRecord.role
+        : 'assistant'
+
+    const blocks = Array.isArray(messageRecord.blocks) ? messageRecord.blocks : []
+    const blockIds: string[] = []
+
+    for (const blockRaw of blocks) {
+      if (!isRecord(blockRaw)) continue
+
+      const blockId =
+        typeof blockRaw.id === 'string' && blockRaw.id ? blockRaw.id : `${incoming.topicId}:${messageId}:block:${blockIds.length}`
+
+      const block: MessageBlock = {
+        ...(blockRaw as MessageBlock),
+        id: blockId,
+        messageId,
+        createdAt: typeof blockRaw.createdAt === 'string' ? blockRaw.createdAt : toIsoString(messageRecord.createdAt),
+        status: typeof blockRaw.status === 'string' ? blockRaw.status : 'success'
+      }
+
+      blockMap.set(blockId, block)
+      blockIds.push(blockId)
+    }
+
+    return {
+      id: messageId,
+      role,
+      assistantId,
+      topicId: incoming.topicId,
+      createdAt: typeof messageRecord.createdAt === 'string' ? messageRecord.createdAt : now,
+      status: typeof messageRecord.status === 'string' ? messageRecord.status : 'success',
+      model: messageRecord.model,
+      usage: messageRecord.usage,
+      metrics: messageRecord.metrics,
+      mentions: Array.isArray(messageRecord.mentions) ? messageRecord.mentions : undefined,
+      blocks: blockIds
+    } as NewMessage
+  })
+
+  const topicMeta: Topic = {
+    id: incoming.topicId,
+    assistantId,
+    name: incoming.name || '未命名',
+    createdAt,
+    updatedAt,
+    messages: []
+  }
+
+  return {
+    topicMeta,
+    messages,
+    blocks: [...blockMap.values()]
+  }
+}
+
+async function applyUpsertToDb(topicId: string, messages: NewMessage[], blocks: MessageBlock[]): Promise<void> {
+  await db.transaction('rw', db.topics, db.message_blocks, async () => {
+    const oldTopic = await db.topics.get(topicId)
+    const oldBlockIds = new Set<string>()
+
+    for (const message of oldTopic?.messages || []) {
+      for (const blockId of message.blocks || []) {
+        if (blockId) oldBlockIds.add(String(blockId))
+      }
+    }
+
+    if (blocks.length > 0) {
+      await db.message_blocks.bulkPut(blocks as any)
+    }
+
+    await db.topics.put({
+      id: topicId,
+      messages
+    })
+
+    const newBlockIds = new Set(blocks.map((block) => String(block.id)))
+    const staleIds = [...oldBlockIds].filter((id) => !newBlockIds.has(id))
+    if (staleIds.length > 0) {
+      await db.message_blocks.bulkDelete(staleIds)
+    }
+  })
+}
+
+async function applyDeleteToDb(topicId: string): Promise<void> {
+  await db.transaction('rw', db.topics, db.message_blocks, async () => {
+    const oldTopic = await db.topics.get(topicId)
+    const blockIds = new Set<string>()
+    for (const message of oldTopic?.messages || []) {
+      for (const blockId of message.blocks || []) {
+        if (blockId) blockIds.add(String(blockId))
+      }
+    }
+
+    await db.topics.delete(topicId)
+    if (blockIds.size > 0) {
+      await db.message_blocks.bulkDelete([...blockIds])
+    }
+  })
+}
+
+function buildPullPlan(items: ServerChangeItem[]): PullPlanItem[] {
+  const snapshot = getTopicSnapshotFromStore()
+  const plan: PullPlanItem[] = []
+
+  for (const item of items) {
+    const localMarker = snapshot.get(item.topicId)
+    if (localMarker === undefined) {
+      plan.push({
+        item,
+        conflict: false,
+        localUpdatedAt: 0,
+        remoteUpdatedAt: Number(item.updatedAt || 0),
+        remoteClientUpdatedAt: Number(item.clientUpdatedAt || 0)
+      })
+      continue
+    }
+
+    const localTs = parseTimeMs(localMarker)
+    const remoteClientTs = Number(item.clientUpdatedAt || 0)
+    const remoteUpdatedTs = Number(item.updatedAt || 0)
+    const remoteTs = Number(item.clientUpdatedAt || item.updatedAt || 0)
+    const conflict = remoteTs <= 0 ? true : localTs > remoteTs + 1000
+    const reason: PullConflictItem['reason'] | undefined =
+      remoteTs <= 0 ? 'remote_timestamp_missing' : conflict ? 'local_newer' : undefined
+
+    plan.push({
+      item,
+      conflict,
+      localUpdatedAt: localTs,
+      remoteUpdatedAt: remoteUpdatedTs,
+      remoteClientUpdatedAt: remoteClientTs,
+      reason
+    })
+  }
+
+  return plan
+}
+
+function toConflictItem(entry: PullPlanItem): PullConflictItem {
+  return {
+    seq: entry.item.seq,
+    topicId: entry.item.topicId,
+    op: entry.item.op,
+    localUpdatedAt: entry.localUpdatedAt,
+    remoteUpdatedAt: entry.remoteUpdatedAt,
+    remoteClientUpdatedAt: entry.remoteClientUpdatedAt,
+    reason: entry.reason || 'local_newer'
+  }
+}
+
+function queueWriteBackFromLocalWins(topicIds: Iterable<string>): number {
+  const snapshot = getTopicSnapshotFromStore()
+  let queued = 0
+
+  for (const topicId of topicIds) {
+    if (!topicId) continue
+    if (snapshot.has(topicId)) {
+      forcedUpsertTopicIds.add(topicId)
+      forcedDeleteTopicIds.delete(topicId)
+    } else {
+      forcedDeleteTopicIds.add(topicId)
+      forcedUpsertTopicIds.delete(topicId)
+    }
+    queued += 1
+  }
+
+  return queued
+}
+
+function applyPullToSnapshot(server: string, applied: Array<{ topicId: string; op: 'upsert' | 'delete'; marker?: string }>) {
+  if (!previousSnapshot || previousSnapshotServer !== server) return
+
+  for (const item of applied) {
+    if (item.op === 'delete') {
+      previousSnapshot.delete(item.topicId)
+      continue
+    }
+
+    if (item.marker) {
+      previousSnapshot.set(item.topicId, item.marker)
+    }
+  }
+
+  savePersistedSnapshot(server, previousSnapshot)
+}
+
+async function pullFromServer({
+  applySafe,
+  skipConnectivityCheck = false,
+  conflictStrategy = 'stop'
+}: {
+  applySafe: boolean
+  skipConnectivityCheck?: boolean
+  conflictStrategy?: PullConflictStrategy
+}): Promise<PullExecutionResult | null> {
+  if (isPullRunning) {
+    logger.verbose('Pull skipped: another pull task is still running.')
+    return null
+  }
+
+  isPullRunning = true
+  try {
+    const { server, token, source } = await getConfig()
+    if (!server) {
+      updateRuntimeConfig({ server, token, source })
+      return null
+    }
+
+    if (applySafe && (previousSnapshot === null || previousSnapshotServer !== server)) {
+      previousSnapshot = loadPersistedSnapshot(server)
+      previousSnapshotServer = server
+    }
+
+    if (!skipConnectivityCheck) {
+      const connectivity = await refreshConnectivity(true)
+      if (!connectivity.ok) return null
+    }
+
+    const cursor = getPullCursor(server)
+    updateRuntimeConfig({ server, token, source })
+
+    const fetched = await fetchAllServerChanges(server, token, cursor)
+    const plan = buildPullPlan(fetched.items)
+    const safe = plan.filter((entry) => !entry.conflict).length
+    const conflicts = plan.length - safe
+    const firstConflictSeq = plan.find((entry) => entry.conflict)?.item.seq ?? null
+    const allConflictItems = plan.filter((entry) => entry.conflict).map(toConflictItem)
+
+    let appliedCount = 0
+    let resolvedLocal = 0
+    let resolvedServer = 0
+    let writeBackQueued = 0
+    let blockedSeq: number | null = applySafe ? null : firstConflictSeq
+    let lastAppliedSeq = cursor
+    const appliedForSnapshot: Array<{ topicId: string; op: 'upsert' | 'delete'; marker?: string }> = []
+    const assistants = cloneAssistantsForUpdate()
+    let assistantsChanged = false
+    const localWinsCandidates = new Set<string>()
+
+    if (applySafe) {
+      for (const entry of plan) {
+        if (entry.conflict) {
+          if (conflictStrategy === 'stop') {
+            blockedSeq = entry.item.seq
+            break
+          }
+
+          if (conflictStrategy === 'local_wins') {
+            localWinsCandidates.add(entry.item.topicId)
+            resolvedLocal += 1
+            lastAppliedSeq = entry.item.seq
+            continue
+          }
+        }
+
+        if (entry.item.op === 'delete') {
+          await applyDeleteToDb(entry.item.topicId)
+          if (removeTopicMetaFromAssistants(assistants, entry.item.topicId)) {
+            assistantsChanged = true
+          }
+          appliedForSnapshot.push({ topicId: entry.item.topicId, op: 'delete' })
+          appliedCount += 1
+          if (entry.conflict) {
+            resolvedServer += 1
+          }
+          lastAppliedSeq = entry.item.seq
+          continue
+        }
+
+        if (!entry.item.topic) {
+          blockedSeq = entry.item.seq
+          break
+        }
+
+        const targetAssistantId = resolveAssistantId(assistants, entry.item.topic)
+        const normalized = normalizeIncomingTopic(entry.item.topic, targetAssistantId)
+        await applyUpsertToDb(entry.item.topic.topicId, normalized.messages, normalized.blocks)
+
+        if (upsertTopicMetaInAssistants(assistants, targetAssistantId, normalized.topicMeta)) {
+          assistantsChanged = true
+        }
+
+        appliedForSnapshot.push({
+          topicId: entry.item.topic.topicId,
+          op: 'upsert',
+          marker: normalized.topicMeta.updatedAt || normalized.topicMeta.createdAt
+        })
+        appliedCount += 1
+        if (entry.conflict) {
+          resolvedServer += 1
+        }
+        lastAppliedSeq = entry.item.seq
+      }
+
+      if (assistantsChanged) {
+        store.dispatch(updateAssistants(assistants))
+      }
+
+      if (localWinsCandidates.size > 0) {
+        writeBackQueued = queueWriteBackFromLocalWins(localWinsCandidates)
+      }
+    }
+
+    const nextCursor = applySafe ? (blockedSeq ? lastAppliedSeq : fetched.nextCursor) : cursor
+    if (applySafe) {
+      setPullCursor(server, nextCursor)
+      applyPullToSnapshot(server, appliedForSnapshot)
+    }
+
+    const pendingConflicts = applySafe
+      ? blockedSeq
+        ? allConflictItems.filter((item) => item.seq >= blockedSeq)
+        : []
+      : allConflictItems
+
+    const summary: PullSummary = {
+      total: plan.length,
+      safe,
+      conflicts,
+      applied: appliedCount,
+      conflictResolvedLocal: resolvedLocal,
+      conflictResolvedServer: resolvedServer,
+      writeBackQueued,
+      nextCursor,
+      blockedSeq
+    }
+
+    updateSyncRuntimeState({
+      pullCursor: nextCursor,
+      lastPullAt: Date.now(),
+      lastPullSummary: summary,
+      pendingConflicts: pendingConflicts.slice(0, 100),
+      lastError: applySafe && blockedSeq ? `Pull blocked by conflict at seq ${blockedSeq}` : null
+    })
+
+    return {
+      summary,
+      pendingConflicts
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    updateSyncRuntimeState({
+      lastError: `Pull failed: ${message}`
+    })
+    logger.error('Pull failed', error instanceof Error ? error : new Error(message))
+    return null
+  } finally {
+    isPullRunning = false
+  }
+}
+
 let syncTimeout: ReturnType<typeof setTimeout> | null = null
 let lastAssistantsState: unknown = null
+let hasStarted = false
 
 function logSyncResult({
   added,
@@ -498,17 +1390,73 @@ function logSyncResult({
 
 async function syncOnce(): Promise<void> {
   const { server } = await getConfig()
-  if (!server) return // 未配置同步服务器，静默跳过
   if (isSyncRunning) return
   isSyncRunning = true
+  const syncMode = getSyncMode()
+  const conflictPolicy = getConflictPolicy()
+  updateSyncRuntimeState({
+    running: true,
+    lastError: null,
+    syncMode,
+    conflictPolicy,
+    pullCursor: server ? getPullCursor(server) : 0
+  })
+
+  const connectivity = await refreshConnectivity()
+  if (!connectivity.ok) {
+    isSyncRunning = false
+    updateSyncRuntimeState({
+      running: false
+    })
+    logger.verbose(`Sync skipped: connectivity=${connectivity.status}, error=${connectivity.error || 'none'}`)
+    return
+  }
 
   try {
-    const currentSnapshot = getTopicSnapshotFromStore()
-
-    // 首次运行：从 localStorage 恢复快照（可能为空）
+    let didInitSnapshot = false
     if (previousSnapshot === null || previousSnapshotServer !== server) {
       previousSnapshot = loadPersistedSnapshot(server)
       previousSnapshotServer = server
+      didInitSnapshot = true
+    }
+
+    if (syncMode === 'auto_safe' || syncMode === 'auto_full') {
+      const pullResult = await pullFromServer({
+        applySafe: true,
+        skipConnectivityCheck: true,
+        conflictStrategy: syncMode === 'auto_safe' ? 'stop' : conflictPolicy
+      })
+      if (pullResult) {
+        const pullSummary = pullResult.summary
+
+        if (pullSummary.conflicts > 0 && pullSummary.blockedSeq) {
+          logger.warn(
+            `Auto pull paused at seq=${pullSummary.blockedSeq ?? 'unknown'}; ` +
+              `safe=${pullSummary.safe}, conflicts=${pullSummary.conflicts}, applied=${pullSummary.applied}`
+          )
+        } else if (pullSummary.conflictResolvedLocal > 0 || pullSummary.conflictResolvedServer > 0) {
+          logger.info(
+            `Auto full pull resolved conflicts: local=${pullSummary.conflictResolvedLocal}, ` +
+              `server=${pullSummary.conflictResolvedServer}, writeBackQueued=${pullSummary.writeBackQueued}`
+          )
+        } else if (pullSummary.applied > 0) {
+          logger.info(
+            `Auto pull applied ${pullSummary.applied} changes; ` +
+              `safe=${pullSummary.safe}, conflicts=${pullSummary.conflicts}`
+          )
+        } else if (pullSummary.total > 0) {
+          logger.verbose(
+            `Auto pull found ${pullSummary.total} changes; ` +
+              `safe=${pullSummary.safe}, conflicts=${pullSummary.conflicts}`
+          )
+        }
+      }
+    }
+
+    const currentSnapshot = getTopicSnapshotFromStore()
+
+    // 首次运行：从 localStorage 恢复快照（可能为空）
+    if (didInitSnapshot && previousSnapshot) {
       logger.info(
         `Initialized: ${currentSnapshot.size} local topics, ` + `${previousSnapshot.size} in last synced snapshot`
       )
@@ -536,7 +1484,9 @@ async function syncOnce(): Promise<void> {
       }
     }
 
-    if (added.length === 0 && updated.length === 0 && deleted.length === 0) {
+    const forcedUpserts = [...forcedUpsertTopicIds]
+
+    if (added.length === 0 && updated.length === 0 && deleted.length === 0 && forcedUpserts.length === 0 && forcedDeleteTopicIds.size === 0) {
       return // 无变更
     }
 
@@ -546,9 +1496,48 @@ async function syncOnce(): Promise<void> {
     let staleCount = 0
     let failedCount = 0
 
-    // 处理新增 + 更新：获取完整数据并上传
-    const toUpload = [...added, ...updated]
+    // 处理新增 + 更新 + 冲突回写（本地优先）
+    const toUpload = [...new Set([...added, ...updated, ...forcedUpserts])]
     if (toUpload.length > 0) {
+      const applyUploadTopics = async (topics: TopicFullData[], forceWrite: boolean) => {
+        if (topics.length === 0) return
+
+        if (topics.length === 1) {
+          const one = topics[0]
+          const result = await apiPostTopic(one, { force: forceWrite })
+          if (TERMINAL_STATUSES.has(result.status)) {
+            const marker = currentSnapshot.get(one.topicId)
+            if (marker !== undefined) nextSnapshot.set(one.topicId, marker)
+            if (forcedUpsertTopicIds.has(one.topicId)) {
+              forcedUpsertTopicIds.delete(one.topicId)
+            }
+          }
+          if (result.status === 'applied') appliedCount++
+          else if (result.status === 'noop' || result.status === 'not_found') noopCount++
+          else if (result.status === 'stale') staleCount++
+          else failedCount++
+          return
+        }
+
+        const results = await apiPostBatch(topics, { force: forceWrite })
+        for (const topic of topics) {
+          const result = results.get(topic.topicId)
+          if (result && TERMINAL_STATUSES.has(result.status)) {
+            const marker = currentSnapshot.get(topic.topicId)
+            if (marker !== undefined) nextSnapshot.set(topic.topicId, marker)
+            if (forcedUpsertTopicIds.has(topic.topicId)) {
+              forcedUpsertTopicIds.delete(topic.topicId)
+            }
+          }
+
+          const status = result?.status ?? 'error'
+          if (status === 'applied') appliedCount++
+          else if (status === 'noop' || status === 'not_found') noopCount++
+          else if (status === 'stale') staleCount++
+          else failedCount++
+        }
+      }
+
       // 分批上传
       for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
         const batch = toUpload.slice(i, i + BATCH_SIZE)
@@ -556,47 +1545,48 @@ async function syncOnce(): Promise<void> {
 
         for (const id of batch) {
           const data = await getTopicFullData(id)
-          if (data) topicsData.push(data)
-        }
-
-        if (topicsData.length === 1) {
-          const one = topicsData[0]
-          const result = await apiPostTopic(one)
-          if (TERMINAL_STATUSES.has(result.status)) {
-            const marker = currentSnapshot.get(one.topicId)
-            if (marker !== undefined) nextSnapshot.set(one.topicId, marker)
-          }
-          if (result.status === 'applied') appliedCount++
-          else if (result.status === 'noop' || result.status === 'not_found') noopCount++
-          else if (result.status === 'stale') staleCount++
-          else failedCount++
-        } else if (topicsData.length > 1) {
-          const results = await apiPostBatch(topicsData)
-          for (const topic of topicsData) {
-            const result = results.get(topic.topicId)
-            if (result && TERMINAL_STATUSES.has(result.status)) {
-              const marker = currentSnapshot.get(topic.topicId)
-              if (marker !== undefined) nextSnapshot.set(topic.topicId, marker)
+          if (!data) {
+            if (forcedUpsertTopicIds.has(id)) {
+              forcedUpsertTopicIds.delete(id)
+              forcedDeleteTopicIds.add(id)
             }
-
-            const status = result?.status ?? 'error'
-            if (status === 'applied') appliedCount++
-            else if (status === 'noop' || status === 'not_found') noopCount++
-            else if (status === 'stale') staleCount++
-            else failedCount++
+            continue
           }
+
+          // 冲突后本地优先回写时，强制使用当前时间避免被服务端 stale 拒绝
+          if (forcedUpsertTopicIds.has(id)) {
+            data.updatedAt = new Date().toISOString()
+          }
+
+          topicsData.push(data)
         }
+
+        const forcedTopics = topicsData.filter((topic) => forcedUpsertTopicIds.has(topic.topicId))
+        const normalTopics = topicsData.filter((topic) => !forcedUpsertTopicIds.has(topic.topicId))
+
+        await applyUploadTopics(normalTopics, false)
+        await applyUploadTopics(forcedTopics, true)
       }
     }
 
     // 处理删除
-    for (let i = 0; i < deleted.length; i += BATCH_SIZE) {
-      const batch = deleted.slice(i, i + BATCH_SIZE)
+    const toDeleteSet = new Set([...deleted, ...forcedDeleteTopicIds])
+    for (const id of toUpload) {
+      toDeleteSet.delete(id)
+      forcedDeleteTopicIds.delete(id)
+    }
+    const toDelete = [...toDeleteSet]
+
+    for (let i = 0; i < toDelete.length; i += BATCH_SIZE) {
+      const batch = toDelete.slice(i, i + BATCH_SIZE)
       const results = await apiDeleteBatch(batch)
       for (const id of batch) {
         const result = results.get(id)
         if (result && TERMINAL_STATUSES.has(result.status)) {
           nextSnapshot.delete(id)
+          if (forcedDeleteTopicIds.has(id)) {
+            forcedDeleteTopicIds.delete(id)
+          }
         }
 
         const status = result?.status ?? 'error'
@@ -610,36 +1600,164 @@ async function syncOnce(): Promise<void> {
     logSyncResult({
       added: added.length,
       updated: updated.length,
-      deleted: deleted.length,
+      deleted: toDelete.length,
       applied: appliedCount,
       noop: noopCount,
       stale: staleCount,
       failed: failedCount
     })
 
+    updateSyncRuntimeState({
+      lastSyncAt: Date.now(),
+      lastResult: {
+        added: added.length,
+        updated: updated.length,
+        deleted: toDelete.length,
+        applied: appliedCount,
+        noop: noopCount,
+        stale: staleCount,
+        failed: failedCount
+      },
+      lastError: failedCount > 0 ? `Some sync actions failed: ${failedCount}` : null
+    })
+
     // 更新快照（内存 + 持久化）
     previousSnapshot = nextSnapshot
     savePersistedSnapshot(server, nextSnapshot)
   } catch (e) {
-    logger.error('Sync loop error', e instanceof Error ? e : new Error(String(e)))
+    const error = e instanceof Error ? e : new Error(String(e))
+    logger.error('Sync loop error', error)
+    updateSyncRuntimeState({
+      lastError: error.message
+    })
   } finally {
     isSyncRunning = false
+    updateSyncRuntimeState({
+      running: false
+    })
   }
 }
 
 // ── 启动 ──────────────────────────────────────────────────────────────
 
 async function start() {
-  const { server } = await getConfig()
-  if (!server) {
-    logger.info('No sync server configured. Set .env RENDERER_VITE_SYNC_SERVER or localStorage "cherry-sync-server".')
-    return
-  }
+  if (hasStarted) return
+  hasStarted = true
 
-  logger.info(`Starting sync to ${server} via Redux store subscription (debounce=${SYNC_INTERVAL}ms)`)
+  const { server } = await getConfig()
+  if (server) {
+    logger.info(`Starting sync to ${server} via Redux store subscription (debounce=${SYNC_INTERVAL}ms)`)
+  } else {
+    logger.info('No sync server configured. Waiting for config from localStorage/cherry-sync.json/.env.')
+  }
 
   // 立即执行一次（建立基线）
   syncOnce()
+
+  // 提供手动触发入口，供设置页调用
+  window.addEventListener('cherry-sync-force', () => {
+    syncOnce()
+  })
+
+  // 提供连通性检查入口，供设置页调用
+  window.addEventListener('cherry-sync-check', () => {
+    refreshConnectivity(true)
+  })
+
+  // 设置同步模式（push_only / manual_pull / auto_safe / auto_full）
+  window.addEventListener('cherry-sync-set-mode', (event) => {
+    const detail = (event as CustomEvent<{ mode?: SyncMode }>).detail
+    if (!isSyncMode(detail?.mode)) return
+    localStorage.setItem(SYNC_MODE_KEY, detail.mode)
+    updateSyncRuntimeState({
+      syncMode: detail.mode
+    })
+    if (detail.mode === 'auto_safe' || detail.mode === 'auto_full') {
+      syncOnce()
+    }
+  })
+
+  // 设置冲突策略（local_wins / server_wins）
+  window.addEventListener('cherry-sync-set-conflict-policy', (event) => {
+    const detail = (event as CustomEvent<{ policy?: ConflictPolicy }>).detail
+    if (!isConflictPolicy(detail?.policy)) return
+    localStorage.setItem(SYNC_CONFLICT_POLICY_KEY, detail.policy)
+    updateSyncRuntimeState({
+      conflictPolicy: detail.policy
+    })
+  })
+
+  // 预览服务端增量（只分析，不写本地）
+  window.addEventListener('cherry-sync-pull-preview', async () => {
+    if (isSyncRunning) {
+      logger.verbose('Pull preview skipped: sync loop is running.')
+      return
+    }
+
+    const result = await pullFromServer({ applySafe: false })
+    if (!result) return
+    const summary = result.summary
+
+    logger.info(
+      `Pull preview: total=${summary.total}, safe=${summary.safe}, ` +
+        `conflicts=${summary.conflicts}, cursor=${summary.nextCursor}`
+    )
+  })
+
+  // 应用可安全拉取的增量，遇到冲突即停（保留 cursor 以便后续人工处理）
+  window.addEventListener('cherry-sync-pull-apply', async () => {
+    if (isSyncRunning) {
+      logger.verbose('Pull apply skipped: sync loop is running.')
+      return
+    }
+
+    const result = await pullFromServer({ applySafe: true, conflictStrategy: 'stop' })
+    if (!result) return
+    const summary = result.summary
+
+    if (summary.conflicts > 0) {
+      logger.warn(
+        `Pull apply paused at seq=${summary.blockedSeq ?? 'unknown'}; ` +
+          `safe=${summary.safe}, conflicts=${summary.conflicts}, applied=${summary.applied}`
+      )
+      return
+    }
+
+    if (summary.applied > 0) {
+      logger.info(`Pull apply completed: applied=${summary.applied}, cursor=${summary.nextCursor}`)
+    } else {
+      logger.verbose('Pull apply completed: no safe server changes to apply.')
+    }
+  })
+
+  // 手动处理冲突并回写（按指定策略）
+  window.addEventListener('cherry-sync-resolve-conflicts', async (event) => {
+    if (isSyncRunning) {
+      logger.verbose('Resolve conflicts skipped: sync loop is running.')
+      return
+    }
+
+    const detail = (event as CustomEvent<{ policy?: ConflictPolicy }>).detail
+    const policy = isConflictPolicy(detail?.policy) ? detail.policy : getConflictPolicy()
+
+    const result = await pullFromServer({
+      applySafe: true,
+      conflictStrategy: policy
+    })
+    if (!result) return
+
+    const summary = result.summary
+    logger.info(
+      `Resolve conflicts (${policy}): local=${summary.conflictResolvedLocal}, ` +
+        `server=${summary.conflictResolvedServer}, writeBackQueued=${summary.writeBackQueued}, ` +
+        `blockedSeq=${summary.blockedSeq ?? 'none'}`
+    )
+
+    // local_wins 需要回写服务器，触发一次完整同步循环即可完成推送
+    if (summary.writeBackQueued > 0) {
+      await syncOnce()
+    }
+  })
 
   // 监听 Redux Store 变化
   store.subscribe(() => {
