@@ -65,9 +65,6 @@
 
 Cherry Studio is a desktop client that supports multiple LLM providers, available on Windows, Mac and Linux.
 
-> Fork Sync Main Doc: [`SYNC_GUIDE.md`](./SYNC_GUIDE.md)  
-> 本 fork 的同步功能（Topic Sync）以此文档为主入口。
-
 👏 Join [Telegram Group](https://t.me/CherryStudioAI)｜[Discord](https://discord.gg/wez8HtpxqQ) | [QQ Group(575014769)](https://qm.qq.com/q/lo0D4qVZKi)
 
 ❤️ Like Cherry Studio? Give it a star 🌟 or [Sponsor](docs/zh/guides/sponsor.md) to support the development!
