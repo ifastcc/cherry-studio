@@ -19,6 +19,7 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       tag: ${{ steps.check.outputs.tag }}
+      build_ref: ${{ steps.check.outputs.build_ref }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -28,55 +29,63 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. 手动指定 Tag
+          set -euo pipefail
+
           INPUT_TAG="${{ github.event.inputs.force_tag }}"
-          
+          TARGET_TAG=""
+
           if [ -n "$INPUT_TAG" ]; then
             if [[ "$INPUT_TAG" != v* ]]; then
-               INPUT_TAG="v$INPUT_TAG"
+              INPUT_TAG="v$INPUT_TAG"
             fi
-            echo "Manual tag $INPUT_TAG detected."
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
-            exit 0
+            TARGET_TAG="$INPUT_TAG"
+            echo "Manual tag requested: $TARGET_TAG"
+          else
+            # 自动模式：只看 upstream 最新 release tag，不跟 upstream/main
+            git clone --bare https://github.com/CherryHQ/cherry-studio.git upstream_repo
+            TARGET_TAG=$(cd upstream_repo && git tag -l "v*" --sort=-v:refname | head -n 1)
+
+            if [ -z "$TARGET_TAG" ]; then
+              echo "No tags found on upstream."
+              echo "should_build=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "Latest upstream release tag: $TARGET_TAG"
+            if gh release view "$TARGET_TAG" > /dev/null 2>&1; then
+              echo "Release $TARGET_TAG already exists in this repo. Skipping."
+              echo "should_build=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
           fi
 
-          # 2. 从官方拉取最新的版本 Tags 作为检测探测器
-          git clone --bare https://github.com/CherryHQ/cherry-studio.git upstream_repo
-          LATEST_TAG=$(cd upstream_repo && git tag -l "v*" --sort=-v:refname | head -n 1)
-          
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No tags found on upstream."
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/CherryHQ/cherry-studio.git || git remote set-url upstream https://github.com/CherryHQ/cherry-studio.git
+          git fetch upstream refs/tags/"$TARGET_TAG":refs/tags/"$TARGET_TAG"
+          git checkout main
+
+          # 将上游 release tag 合入 fork/main；保留本仓库 workflows
+          git merge "$TARGET_TAG" --no-commit --no-ff || true
+          if git ls-files -u | grep -q .; then
+            echo "::error::Merge conflicts detected when syncing $TARGET_TAG. Please resolve manually."
+            git merge --abort || true
+            exit 1
           fi
-          
-          echo "Latest upstream tag: $LATEST_TAG"
-          
-          # 3. 检查我们当前仓库是不是已经发布过这个版本 Release
-          if gh release view "$LATEST_TAG" > /dev/null 2>&1; then
-            echo "Release $LATEST_TAG already exists in this repo. Skipping."
-            echo "should_build=false" >> $GITHUB_OUTPUT
+
+          git restore --source=HEAD --staged --worktree .github/workflows/ || true
+
+          if git diff --cached --quiet; then
+            echo "No new changes after merging $TARGET_TAG."
           else
-            echo "New release detected: $LATEST_TAG"
-            
-            # 【优雅的同步手段】 - 仅在有稳定的 Release 产生时，才签下该稳定版的 commit 与本地合并
-            git remote add upstream https://github.com/CherryHQ/cherry-studio.git || true
-            git fetch upstream refs/tags/"$LATEST_TAG":refs/tags/"$LATEST_TAG" || true
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            
-            git merge "$LATEST_TAG" --no-commit --no-ff || true
-            git restore --staged .github/workflows/ || true
-            git checkout HEAD -- .github/workflows/ || true
-            
-            git commit -m "chore: sync stable release $LATEST_TAG from upstream excluding workflows modifications" || true
-            git push origin main || true
-            
-            # 不要去推送 tag，让 Release 阶段自动补上空壳关联
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            git commit -m "chore: sync stable release $TARGET_TAG from upstream excluding workflows modifications"
+            git push origin main
           fi
+
+          BUILD_SHA=$(git rev-parse HEAD)
+          echo "should_build=true" >> $GITHUB_OUTPUT
+          echo "tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+          echo "build_ref=$BUILD_SHA" >> $GITHUB_OUTPUT
 
   build_and_release:
     needs: sync_and_prepare
@@ -88,12 +97,18 @@ jobs:
       fail-fast: false
 
     steps:
-      - name: Check out official repository cleanly
+      - name: Check out fork repository code
         uses: actions/checkout@v6
         with:
-          # 神来之笔：我们直接拉取官方的原版 tag 代码当场编译，拒绝任何中间的 Git Merge 本地混淆
-          repository: CherryHQ/cherry-studio
-          ref: ${{ needs.sync_and_prepare.outputs.tag }}
+          fetch-depth: 0
+          ref: ${{ needs.sync_and_prepare.outputs.build_ref }}
+
+      - name: Verify topic sync patch exists
+        shell: bash
+        run: |
+          test -f src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
+          grep -q "key: 'topic_sync'" src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
+          grep -q '"topic_sync"' src/renderer/src/i18n/locales/zh-cn.json
 
       - name: Set package.json version
         shell: bash
@@ -179,10 +194,9 @@ jobs:
           draft: false
           allowUpdates: true
           makeLatest: true
-          # 指定创建关联在本库 main 分支的 Release
-          commit: "main" 
+          # 将 release tag 绑定到本次实际构建的 commit
+          commit: ${{ needs.sync_and_prepare.outputs.build_ref }}
           name: "Cherry Studio ${{ needs.sync_and_prepare.outputs.tag }}"
           tag: ${{ needs.sync_and_prepare.outputs.tag }}
           artifacts: "dist/*.exe,dist/*.zip,dist/*.dmg,dist/*.AppImage,dist/*.snap,dist/*.deb,dist/*.rpm,dist/*.tar.gz,dist/latest*.yml,dist/rc*.yml,dist/beta*.yml,dist/*.blockmap"
           token: ${{ secrets.GITHUB_TOKEN }}
-
