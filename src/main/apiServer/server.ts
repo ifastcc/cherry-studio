@@ -15,6 +15,7 @@ const GLOBAL_KEEPALIVE_TIMEOUT_MS = 60_000
 
 export class ApiServer {
   private server: ReturnType<typeof createServer> | null = null
+  private lastRunningSnapshot: { hasServer: boolean; isListening: boolean; result: boolean } | null = null
 
   async start(): Promise<void> {
     if (this.server && this.server.listening) {
@@ -87,7 +88,15 @@ export class ApiServer {
     const isListening = this.server?.listening || false
     const result = hasServer && isListening
 
-    logger.debug('isRunning check', { hasServer, isListening, result })
+    if (
+      !this.lastRunningSnapshot ||
+      this.lastRunningSnapshot.hasServer !== hasServer ||
+      this.lastRunningSnapshot.isListening !== isListening ||
+      this.lastRunningSnapshot.result !== result
+    ) {
+      logger.debug('isRunning check', { hasServer, isListening, result })
+      this.lastRunningSnapshot = { hasServer, isListening, result }
+    }
 
     return result
   }

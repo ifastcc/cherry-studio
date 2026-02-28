@@ -88,7 +88,11 @@ const DataSettings: FC = () => {
     { key: 'divider_1', isDivider: true, text: t('settings.data.divider.cloud_storage') },
     { key: 'local_backup', title: t('settings.data.local.title'), icon: <FolderCog size={16} /> },
     { key: 'webdav', title: t('settings.data.webdav.title'), icon: <CloudSyncOutlined style={{ fontSize: 16 }} /> },
-    { key: 'topic_sync', title: t('settings.data.topic_sync.title', 'Topic Sync'), icon: <CloudSyncOutlined style={{ fontSize: 16 }} /> },
+    {
+      key: 'topic_sync',
+      title: t('settings.data.topic_sync.title', 'Topic Sync'),
+      icon: <CloudSyncOutlined style={{ fontSize: 16 }} />
+    },
     { key: 'nutstore', title: t('settings.data.nutstore.title'), icon: <NutstoreIcon /> },
     { key: 's3', title: t('settings.data.s3.title.label'), icon: <CloudServerOutlined style={{ fontSize: 16 }} /> },
     { key: 'divider_2', isDivider: true, text: t('settings.data.divider.import_settings') },

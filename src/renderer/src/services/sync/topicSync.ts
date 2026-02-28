@@ -2,30 +2,29 @@
  * Cherry Studio → Sync Server 增量推送
  *
  * 零侵入设计：只需在 entryPoint.tsx 中 import 此文件即可启用同步。
- * 逻辑：每 SYNC_INTERVAL 毫秒轮询一次，对比 Topic 快照（ID + updatedAt），
+ * 逻辑：按配置的同步间隔轮询，对比 Topic 快照（ID + updatedAt），
  *        将新增/更新/删除的 Topic 推送到同步服务器。
  *
  * 配置方式（优先级从高到低）：
- *   1. localStorage（运行时覆盖，DevTools Console 中设置）：
+ *   1. localStorage（运行时覆盖，设置页中写入）：
  *      localStorage.setItem('cherry-sync-server', 'http://your-server:3456')
  *      localStorage.setItem('cherry-sync-token', 'your-token')
- *   2. .env 文件（项目根目录，参考 .env.sync 模板）：
- *      RENDERER_VITE_SYNC_SERVER=http://your-server:3456
- *      RENDERER_VITE_SYNC_TOKEN=your-token
  */
 import { loggerService } from '@logger'
 import db from '@renderer/databases'
 import store from '@renderer/store'
 import { updateAssistants } from '@renderer/store/assistants'
-import { MessageBlockStatus } from '@renderer/types/newMessage'
 import type { Topic } from '@renderer/types'
 import type { Message as NewMessage, MessageBlock } from '@renderer/types/newMessage'
+import { MessageBlockStatus } from '@renderer/types/newMessage'
 
 const logger = loggerService.withContext('TopicSync')
 
 // ── 配置 ──────────────────────────────────────────────────────────────
 
-const SYNC_INTERVAL = 30_000 // 30 秒
+const DEFAULT_SYNC_INTERVAL_MS = 30_000 // 30 秒
+const MIN_SYNC_INTERVAL_MS = 10_000
+const MAX_SYNC_INTERVAL_MS = 3_600_000
 const BATCH_SIZE = 20 // 批量上传时每批最大数量
 const INIT_DELAY = 8_000 // 初始化延迟（等 Dexie + Redux persist 准备好）
 const REQUEST_TIMEOUT = 15_000
@@ -38,13 +37,15 @@ const SYNC_TOKEN_KEY = 'cherry-sync-token'
 const SYNC_RUNTIME_KEY = 'cherry-sync-runtime'
 const SYNC_MODE_KEY = 'cherry-sync-mode'
 const SYNC_CONFLICT_POLICY_KEY = 'cherry-sync-conflict-policy'
+const SYNC_INTERVAL_KEY = 'cherry-sync-interval-ms'
 const PULL_CURSOR_KEY_PREFIX = 'cherry-sync-pull-cursor:'
 
-type ConfigSource = 'localStorage' | 'file' | 'env' | 'none'
+type ConfigSource = 'localStorage' | 'none'
 type ConnectionStatus = 'unknown' | 'online' | 'offline' | 'unauthorized'
 type SyncMode = 'push_only' | 'manual_pull' | 'auto_safe' | 'auto_full'
 type ConflictPolicy = 'local_wins' | 'server_wins'
 type PullConflictStrategy = 'stop' | ConflictPolicy
+type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'conflict' | 'not_found' | 'error'
 
 interface PullConflictItem {
   seq: number
@@ -83,11 +84,26 @@ interface SyncRuntimeResult {
   failed: number
 }
 
+interface SyncFailureItem {
+  topicId: string
+  op: 'upsert' | 'delete'
+  status: SyncActionStatus
+  error: string | null
+}
+
+interface SyncProgressState {
+  phase: 'idle' | 'pull' | 'push_upsert' | 'push_delete'
+  total: number
+  processed: number
+  failed: number
+}
+
 interface SyncRuntimeState {
   configured: boolean
   server: string
   tokenConfigured: boolean
   configSource: ConfigSource
+  syncIntervalMs: number
   syncMode: SyncMode
   conflictPolicy: ConflictPolicy
   pullCursor: number
@@ -100,6 +116,8 @@ interface SyncRuntimeState {
   lastPullSummary: PullSummary | null
   pendingConflicts: PullConflictItem[]
   lastResult: SyncRuntimeResult | null
+  lastFailures: SyncFailureItem[]
+  syncProgress: SyncProgressState
   lastError: string | null
 }
 
@@ -108,6 +126,7 @@ const DEFAULT_SYNC_RUNTIME_STATE: SyncRuntimeState = {
   server: '',
   tokenConfigured: false,
   configSource: 'none',
+  syncIntervalMs: DEFAULT_SYNC_INTERVAL_MS,
   syncMode: 'push_only',
   conflictPolicy: 'local_wins',
   pullCursor: 0,
@@ -120,6 +139,13 @@ const DEFAULT_SYNC_RUNTIME_STATE: SyncRuntimeState = {
   lastPullSummary: null,
   pendingConflicts: [],
   lastResult: null,
+  lastFailures: [],
+  syncProgress: {
+    phase: 'idle',
+    total: 0,
+    processed: 0,
+    failed: 0
+  },
   lastError: null
 }
 
@@ -170,7 +196,14 @@ function getSyncRuntimeState(): SyncRuntimeState {
       ...parsed,
       pendingConflicts: Array.isArray(parsed.pendingConflicts) ? [...parsed.pendingConflicts] : [],
       lastPullSummary: parsed.lastPullSummary ? { ...parsed.lastPullSummary } : null,
-      lastResult: parsed.lastResult ? { ...parsed.lastResult } : null
+      lastResult: parsed.lastResult ? { ...parsed.lastResult } : null,
+      lastFailures: Array.isArray(parsed.lastFailures) ? [...parsed.lastFailures] : [],
+      syncProgress: parsed.syncProgress
+        ? {
+            ...DEFAULT_SYNC_RUNTIME_STATE.syncProgress,
+            ...parsed.syncProgress
+          }
+        : { ...DEFAULT_SYNC_RUNTIME_STATE.syncProgress }
     }
   } catch {
     return { ...DEFAULT_SYNC_RUNTIME_STATE }
@@ -190,17 +223,10 @@ function updateSyncRuntimeState(patch: Partial<SyncRuntimeState>) {
   }
 }
 
-function updateRuntimeConfig({
-  server,
-  token,
-  source
-}: {
-  server: string
-  token: string
-  source: ConfigSource
-}) {
+function updateRuntimeConfig({ server, token, source }: { server: string; token: string; source: ConfigSource }) {
   const syncMode = getSyncMode()
   const conflictPolicy = getConflictPolicy()
+  const syncIntervalMs = getSyncIntervalMs()
   const pullCursor = server ? getPullCursor(server) : 0
 
   updateSyncRuntimeState({
@@ -208,6 +234,7 @@ function updateRuntimeConfig({
     server,
     tokenConfigured: Boolean(token),
     configSource: source,
+    syncIntervalMs,
     syncMode,
     conflictPolicy,
     pullCursor
@@ -234,6 +261,23 @@ function getConflictPolicy(): ConflictPolicy {
   const raw = (localStorage.getItem(SYNC_CONFLICT_POLICY_KEY) || '').trim()
   if (isConflictPolicy(raw)) return raw
   return 'local_wins'
+}
+
+function normalizeSyncIntervalMs(raw: unknown): number {
+  let value: number | null = null
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    value = Math.floor(raw)
+  } else if (typeof raw === 'string') {
+    const parsed = Number.parseInt(raw, 10)
+    if (Number.isFinite(parsed)) value = parsed
+  }
+
+  if (value === null) return DEFAULT_SYNC_INTERVAL_MS
+  return Math.min(MAX_SYNC_INTERVAL_MS, Math.max(MIN_SYNC_INTERVAL_MS, value))
+}
+
+function getSyncIntervalMs(): number {
+  return normalizeSyncIntervalMs(localStorage.getItem(SYNC_INTERVAL_KEY))
 }
 
 function getPullCursorKey(server: string): string {
@@ -361,11 +405,7 @@ async function getConfig(): Promise<{ server: string; token: string; source: Con
   const localOverrides = `${localServer}|${localToken}`
   const now = Date.now()
 
-  if (
-    cachedConfigAt > 0 &&
-    cachedLocalOverrides === localOverrides &&
-    now - cachedConfigAt < CONFIG_CACHE_TTL
-  ) {
+  if (cachedConfigAt > 0 && cachedLocalOverrides === localOverrides && now - cachedConfigAt < CONFIG_CACHE_TTL) {
     updateRuntimeConfig({
       server: cachedServer,
       token: cachedToken,
@@ -374,30 +414,9 @@ async function getConfig(): Promise<{ server: string; token: string; source: Con
     return { server: cachedServer, token: cachedToken, source: cachedSource }
   }
 
-  let server = localServer || import.meta.env.RENDERER_VITE_SYNC_SERVER || ''
-  let token = localToken || import.meta.env.RENDERER_VITE_SYNC_TOKEN || ''
-  let source: ConfigSource = localServer ? 'localStorage' : server ? 'env' : 'none'
-
-  try {
-    // 尝试读取本地配置文件 (支持极低侵入的分发模式)
-    const appInfo = await window.api.getAppInfo()
-    if (appInfo && appInfo.appDataPath) {
-      const configPath = `${appInfo.appDataPath}/cherry-sync.json`
-      const configText = await window.api.fs.readText(configPath).catch(() => null)
-      if (configText) {
-        const configJson = JSON.parse(configText)
-        if (configJson.server && !localStorage.getItem(SYNC_SERVER_KEY)) {
-          server = configJson.server
-          source = 'file'
-        }
-        if (configJson.token && !localStorage.getItem(SYNC_TOKEN_KEY)) {
-          token = configJson.token
-        }
-      }
-    }
-  } catch (error) {
-    // 忽略读取配置文件失败
-  }
+  const server = localServer
+  const token = localToken
+  const source: ConfigSource = server ? 'localStorage' : 'none'
 
   cachedServer = server.replace(/\/+$/, '')
   cachedToken = token
@@ -436,8 +455,6 @@ interface TopicFullData {
     blocks: unknown[]
   }>
 }
-
-type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'conflict' | 'not_found' | 'error'
 
 interface SyncActionResult {
   ok: boolean
@@ -602,6 +619,11 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
   }
 }
 
+function shortenResponseText(text: string): string {
+  const compact = text.replace(/\s+/g, ' ').trim()
+  return compact.length > 240 ? `${compact.slice(0, 240)}...` : compact
+}
+
 function toSyncActionResult(
   fallbackTopicId: string,
   payload: unknown,
@@ -613,9 +635,9 @@ function toSyncActionResult(
 
   const item = payload as Record<string, unknown>
   const statusRaw = typeof item.status === 'string' ? item.status : 'error'
-  const status = (['applied', 'noop', 'stale', 'conflict', 'not_found', 'error'].includes(statusRaw)
-    ? statusRaw
-    : 'error') as SyncActionStatus
+  const status = (
+    ['applied', 'noop', 'stale', 'conflict', 'not_found', 'error'].includes(statusRaw) ? statusRaw : 'error'
+  ) as SyncActionStatus
 
   return {
     ok: item.ok === true || status !== 'error',
@@ -639,10 +661,12 @@ async function apiPostTopic(topic: TopicFullData, options?: { force?: boolean })
       headers['X-Sync-Force'] = '1'
     }
 
+    const body = JSON.stringify(topic)
+    const bodyBytes = new TextEncoder().encode(body).length
     const resp = await fetchWithTimeout(`${server}/api/topics`, {
       method: 'POST',
       headers,
-      body: JSON.stringify(topic)
+      body
     })
     const text = await resp.text()
     let decoded: unknown = null
@@ -651,7 +675,10 @@ async function apiPostTopic(topic: TopicFullData, options?: { force?: boolean })
     } catch (_) {}
 
     if (!resp.ok) {
-      logger.error(`POST /api/topics failed: ${resp.status} ${text}`)
+      logger.error(`POST /api/topics failed: ${resp.status} ${shortenResponseText(text)}`)
+      if (resp.status === 413) {
+        return { ok: false, topicId: topic.topicId, status: 'error', error: `payload_too_large_${bodyBytes}` }
+      }
       return { ok: false, topicId: topic.topicId, status: 'error', error: `http_${resp.status}` }
     }
 
@@ -662,7 +689,10 @@ async function apiPostTopic(topic: TopicFullData, options?: { force?: boolean })
   }
 }
 
-async function apiPostBatch(topics: TopicFullData[], options?: { force?: boolean }): Promise<Map<string, SyncActionResult>> {
+async function apiPostBatch(
+  topics: TopicFullData[],
+  options?: { force?: boolean }
+): Promise<Map<string, SyncActionResult>> {
   const { server, token } = await getConfig()
   const out = new Map<string, SyncActionResult>()
 
@@ -675,6 +705,15 @@ async function apiPostBatch(topics: TopicFullData[], options?: { force?: boolean
         error: 'missing_server'
       })
     }
+    return out
+  }
+
+  // Single topic fallback uses the non-batch endpoint to reduce payload wrapper overhead
+  // and avoid repeated 413 responses from /batch for borderline payload sizes.
+  if (topics.length === 1) {
+    const topic = topics[0]
+    const result = await apiPostTopic(topic, options)
+    out.set(topic.topicId, result)
     return out
   }
 
@@ -700,22 +739,33 @@ async function apiPostBatch(topics: TopicFullData[], options?: { force?: boolean
     } catch (_) {}
 
     if (!resp.ok) {
-      logger.error(`POST /api/topics/batch failed: ${resp.status} ${text}`)
+      logger.error(`POST /api/topics/batch failed: ${resp.status} ${shortenResponseText(text)}`)
+      if (resp.status === 413 && topics.length > 1) {
+        const middle = Math.ceil(topics.length / 2)
+        const left = await apiPostBatch(topics.slice(0, middle), options)
+        const right = await apiPostBatch(topics.slice(middle), options)
+        for (const [topicId, result] of left.entries()) {
+          out.set(topicId, result)
+        }
+        for (const [topicId, result] of right.entries()) {
+          out.set(topicId, result)
+        }
+        return out
+      }
       for (const topic of topics) {
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(topic)).length
         out.set(topic.topicId, {
           ok: false,
           topicId: topic.topicId,
           status: 'error',
-          error: `http_${resp.status}`
+          error: resp.status === 413 ? `payload_too_large_${payloadBytes}` : `http_${resp.status}`
         })
       }
       return out
     }
 
     const results =
-      decoded &&
-      typeof decoded === 'object' &&
-      Array.isArray((decoded as Record<string, unknown>).results)
+      decoded && typeof decoded === 'object' && Array.isArray((decoded as Record<string, unknown>).results)
         ? ((decoded as Record<string, unknown>).results as unknown[])
         : []
 
@@ -775,7 +825,7 @@ async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActio
     } catch (_) {}
 
     if (!resp.ok) {
-      logger.error(`POST /api/topics/delete-batch failed: ${resp.status} ${text}`)
+      logger.error(`POST /api/topics/delete-batch failed: ${resp.status} ${shortenResponseText(text)}`)
       for (const topicId of topicIds) {
         out.set(topicId, { ok: false, topicId, status: 'error', error: `http_${resp.status}` })
       }
@@ -783,9 +833,7 @@ async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActio
     }
 
     const results =
-      decoded &&
-      typeof decoded === 'object' &&
-      Array.isArray((decoded as Record<string, unknown>).results)
+      decoded && typeof decoded === 'object' && Array.isArray((decoded as Record<string, unknown>).results)
         ? ((decoded as Record<string, unknown>).results as unknown[])
         : []
 
@@ -1030,7 +1078,8 @@ function normalizeIncomingTopic(
         ...(blockRecord as unknown as MessageBlock),
         id: blockId,
         messageId,
-        createdAt: typeof blockRecord.createdAt === 'string' ? blockRecord.createdAt : toIsoString(messageRecord.createdAt),
+        createdAt:
+          typeof blockRecord.createdAt === 'string' ? blockRecord.createdAt : toIsoString(messageRecord.createdAt),
         status: toMessageBlockStatus(blockRecord.status)
       }
 
@@ -1183,7 +1232,10 @@ function queueWriteBackFromLocalWins(topicIds: Iterable<string>): number {
   return queued
 }
 
-function applyPullToSnapshot(server: string, applied: Array<{ topicId: string; op: 'upsert' | 'delete'; marker?: string }>) {
+function applyPullToSnapshot(
+  server: string,
+  applied: Array<{ topicId: string; op: 'upsert' | 'delete'; marker?: string }>
+) {
   if (!previousSnapshot || previousSnapshotServer !== server) return
 
   for (const item of applied) {
@@ -1366,8 +1418,25 @@ async function pullFromServer({
 }
 
 let syncTimeout: ReturnType<typeof setTimeout> | null = null
+let syncIntervalTimer: ReturnType<typeof setInterval> | null = null
 let lastAssistantsState: unknown = null
 let hasStarted = false
+
+function restartSyncIntervalTimer() {
+  if (syncIntervalTimer) {
+    clearInterval(syncIntervalTimer)
+    syncIntervalTimer = null
+  }
+
+  const intervalMs = getSyncIntervalMs()
+  updateSyncRuntimeState({
+    syncIntervalMs: intervalMs
+  })
+
+  syncIntervalTimer = setInterval(() => {
+    syncOnce()
+  }, intervalMs)
+}
 
 function logSyncResult({
   added,
@@ -1403,6 +1472,22 @@ function logSyncResult({
   logger.verbose(message)
 }
 
+function buildFailureMessage(failures: SyncFailureItem[], failedCount: number): string {
+  if (failedCount <= 0) return ''
+  if (failures.length === 0) return `Some sync actions failed: ${failedCount}`
+
+  const grouped = new Map<string, number>()
+  for (const failure of failures) {
+    const key = failure.error || failure.status
+    grouped.set(key, (grouped.get(key) || 0) + 1)
+  }
+
+  const topReason = [...grouped.entries()].sort((a, b) => b[1] - a[1])[0]
+  if (!topReason) return `Some sync actions failed: ${failedCount}`
+
+  return `Sync failed: ${failedCount} actions, top reason=${topReason[0]} (${topReason[1]})`
+}
+
 // ── 同步主循环 ────────────────────────────────────────────────────────
 
 async function syncOnce(): Promise<void> {
@@ -1416,14 +1501,26 @@ async function syncOnce(): Promise<void> {
     lastError: null,
     syncMode,
     conflictPolicy,
-    pullCursor: server ? getPullCursor(server) : 0
+    pullCursor: server ? getPullCursor(server) : 0,
+    syncProgress: {
+      phase: 'pull',
+      total: 0,
+      processed: 0,
+      failed: 0
+    }
   })
 
   const connectivity = await refreshConnectivity()
   if (!connectivity.ok) {
     isSyncRunning = false
     updateSyncRuntimeState({
-      running: false
+      running: false,
+      syncProgress: {
+        phase: 'idle',
+        total: 0,
+        processed: 0,
+        failed: 0
+      }
     })
     logger.verbose(`Sync skipped: connectivity=${connectivity.status}, error=${connectivity.error || 'none'}`)
     return
@@ -1445,6 +1542,14 @@ async function syncOnce(): Promise<void> {
       })
       if (pullResult) {
         const pullSummary = pullResult.summary
+        updateSyncRuntimeState({
+          syncProgress: {
+            phase: 'pull',
+            total: pullSummary.total,
+            processed: pullSummary.applied,
+            failed: pullSummary.conflicts
+          }
+        })
 
         if (pullSummary.conflicts > 0 && pullSummary.blockedSeq) {
           logger.warn(
@@ -1503,7 +1608,13 @@ async function syncOnce(): Promise<void> {
 
     const forcedUpserts = [...forcedUpsertTopicIds]
 
-    if (added.length === 0 && updated.length === 0 && deleted.length === 0 && forcedUpserts.length === 0 && forcedDeleteTopicIds.size === 0) {
+    if (
+      added.length === 0 &&
+      updated.length === 0 &&
+      deleted.length === 0 &&
+      forcedUpserts.length === 0 &&
+      forcedDeleteTopicIds.size === 0
+    ) {
       return // 无变更
     }
 
@@ -1512,9 +1623,48 @@ async function syncOnce(): Promise<void> {
     let noopCount = 0
     let staleCount = 0
     let failedCount = 0
+    const failedActions: SyncFailureItem[] = []
+    const recordFailure = (
+      topicId: string,
+      op: 'upsert' | 'delete',
+      status: SyncActionStatus,
+      error: string | null | undefined
+    ) => {
+      if (failedActions.length >= 100) return
+      failedActions.push({
+        topicId,
+        op,
+        status,
+        error: error || null
+      })
+    }
 
     // 处理新增 + 更新 + 冲突回写（本地优先）
     const toUpload = [...new Set([...added, ...updated, ...forcedUpserts])]
+    let uploadProcessed = 0
+    let uploadFailed = 0
+    const emitUploadProgress = (force = false) => {
+      const total = toUpload.length
+      if (!force && uploadProcessed % 5 !== 0 && uploadProcessed !== total) return
+      updateSyncRuntimeState({
+        syncProgress: {
+          phase: 'push_upsert',
+          total,
+          processed: uploadProcessed,
+          failed: uploadFailed
+        }
+      })
+    }
+
+    updateSyncRuntimeState({
+      syncProgress: {
+        phase: 'push_upsert',
+        total: toUpload.length,
+        processed: 0,
+        failed: 0
+      }
+    })
+
     if (toUpload.length > 0) {
       const applyUploadTopics = async (topics: TopicFullData[], forceWrite: boolean) => {
         if (topics.length === 0) return
@@ -1532,7 +1682,13 @@ async function syncOnce(): Promise<void> {
           if (result.status === 'applied') appliedCount++
           else if (result.status === 'noop' || result.status === 'not_found') noopCount++
           else if (result.status === 'stale') staleCount++
-          else failedCount++
+          else {
+            failedCount++
+            uploadFailed++
+            recordFailure(one.topicId, 'upsert', result.status, result.error)
+          }
+          uploadProcessed++
+          emitUploadProgress()
           return
         }
 
@@ -1547,11 +1703,17 @@ async function syncOnce(): Promise<void> {
             }
           }
 
-          const status = result?.status ?? 'error'
+          const status: SyncActionStatus = result?.status ?? 'error'
           if (status === 'applied') appliedCount++
           else if (status === 'noop' || status === 'not_found') noopCount++
           else if (status === 'stale') staleCount++
-          else failedCount++
+          else {
+            failedCount++
+            uploadFailed++
+            recordFailure(topic.topicId, 'upsert', status, result?.error)
+          }
+          uploadProcessed++
+          emitUploadProgress()
         }
       }
 
@@ -1567,6 +1729,8 @@ async function syncOnce(): Promise<void> {
               forcedUpsertTopicIds.delete(id)
               forcedDeleteTopicIds.add(id)
             }
+            uploadProcessed++
+            emitUploadProgress()
             continue
           }
 
@@ -1584,6 +1748,7 @@ async function syncOnce(): Promise<void> {
         await applyUploadTopics(normalTopics, false)
         await applyUploadTopics(forcedTopics, true)
       }
+      emitUploadProgress(true)
     }
 
     // 处理删除
@@ -1593,6 +1758,29 @@ async function syncOnce(): Promise<void> {
       forcedDeleteTopicIds.delete(id)
     }
     const toDelete = [...toDeleteSet]
+    let deleteProcessed = 0
+    let deleteFailed = 0
+    const emitDeleteProgress = (force = false) => {
+      const total = toDelete.length
+      if (!force && deleteProcessed % 5 !== 0 && deleteProcessed !== total) return
+      updateSyncRuntimeState({
+        syncProgress: {
+          phase: 'push_delete',
+          total,
+          processed: deleteProcessed,
+          failed: deleteFailed
+        }
+      })
+    }
+
+    updateSyncRuntimeState({
+      syncProgress: {
+        phase: 'push_delete',
+        total: toDelete.length,
+        processed: 0,
+        failed: 0
+      }
+    })
 
     for (let i = 0; i < toDelete.length; i += BATCH_SIZE) {
       const batch = toDelete.slice(i, i + BATCH_SIZE)
@@ -1606,13 +1794,20 @@ async function syncOnce(): Promise<void> {
           }
         }
 
-        const status = result?.status ?? 'error'
+        const status: SyncActionStatus = result?.status ?? 'error'
         if (status === 'applied') appliedCount++
         else if (status === 'noop' || status === 'not_found') noopCount++
         else if (status === 'stale') staleCount++
-        else failedCount++
+        else {
+          failedCount++
+          deleteFailed++
+          recordFailure(id, 'delete', status, result?.error)
+        }
+        deleteProcessed++
+        emitDeleteProgress()
       }
     }
+    emitDeleteProgress(true)
 
     logSyncResult({
       added: added.length,
@@ -1635,7 +1830,14 @@ async function syncOnce(): Promise<void> {
         stale: staleCount,
         failed: failedCount
       },
-      lastError: failedCount > 0 ? `Some sync actions failed: ${failedCount}` : null
+      lastFailures: failedCount > 0 ? failedActions : [],
+      lastError: failedCount > 0 ? buildFailureMessage(failedActions, failedCount) : null,
+      syncProgress: {
+        phase: 'idle',
+        total: 0,
+        processed: 0,
+        failed: 0
+      }
     })
 
     // 更新快照（内存 + 持久化）
@@ -1645,12 +1847,25 @@ async function syncOnce(): Promise<void> {
     const error = e instanceof Error ? e : new Error(String(e))
     logger.error('Sync loop error', error)
     updateSyncRuntimeState({
-      lastError: error.message
+      lastFailures: [],
+      lastError: error.message,
+      syncProgress: {
+        phase: 'idle',
+        total: 0,
+        processed: 0,
+        failed: 0
+      }
     })
   } finally {
     isSyncRunning = false
     updateSyncRuntimeState({
-      running: false
+      running: false,
+      syncProgress: {
+        phase: 'idle',
+        total: 0,
+        processed: 0,
+        failed: 0
+      }
     })
   }
 }
@@ -1662,11 +1877,14 @@ async function start() {
   hasStarted = true
 
   const { server } = await getConfig()
+  const intervalMs = getSyncIntervalMs()
   if (server) {
-    logger.info(`Starting sync to ${server} via Redux store subscription (debounce=${SYNC_INTERVAL}ms)`)
+    logger.info(`Starting sync to ${server} (interval=${intervalMs}ms)`)
   } else {
-    logger.info('No sync server configured. Waiting for config from localStorage/cherry-sync.json/.env.')
+    logger.info('No sync server configured. Waiting for config from settings.')
   }
+
+  restartSyncIntervalTimer()
 
   // 立即执行一次（建立基线）
   syncOnce()
@@ -1702,6 +1920,80 @@ async function start() {
     updateSyncRuntimeState({
       conflictPolicy: detail.policy
     })
+  })
+
+  window.addEventListener('cherry-sync-set-interval', (event) => {
+    const detail = (event as CustomEvent<{ intervalMs?: number }>).detail
+    const normalized = normalizeSyncIntervalMs(detail?.intervalMs)
+    localStorage.setItem(SYNC_INTERVAL_KEY, String(normalized))
+    restartSyncIntervalTimer()
+  })
+
+  window.addEventListener('cherry-sync-retry-failed-actions', async () => {
+    if (isSyncRunning) {
+      logger.verbose('Retry failed actions skipped: sync loop is running.')
+      return
+    }
+
+    const runtime = getSyncRuntimeState()
+    if (!runtime.lastFailures.length) return
+
+    for (const failure of runtime.lastFailures) {
+      if (!failure.topicId) continue
+      if (failure.op === 'delete') {
+        forcedDeleteTopicIds.add(failure.topicId)
+        forcedUpsertTopicIds.delete(failure.topicId)
+      } else {
+        forcedUpsertTopicIds.add(failure.topicId)
+        forcedDeleteTopicIds.delete(failure.topicId)
+      }
+    }
+
+    updateSyncRuntimeState({
+      lastError: null
+    })
+    logger.info(`Retry queued for ${runtime.lastFailures.length} failed actions`)
+    await syncOnce()
+  })
+
+  window.addEventListener('cherry-sync-dismiss-errors', () => {
+    updateSyncRuntimeState({
+      lastError: null,
+      lastFailures: []
+    })
+    logger.info('Sync errors dismissed by user action')
+  })
+
+  window.addEventListener('cherry-sync-rebuild-baseline', async () => {
+    if (isSyncRunning) {
+      logger.verbose('Rebuild baseline skipped: sync loop is running.')
+      return
+    }
+
+    const { server, token, source } = await getConfig()
+    if (!server) {
+      updateRuntimeConfig({ server, token, source })
+      return
+    }
+
+    const snapshot = getTopicSnapshotFromStore()
+    previousSnapshot = new Map(snapshot)
+    previousSnapshotServer = server
+    savePersistedSnapshot(server, previousSnapshot)
+    forcedUpsertTopicIds.clear()
+    forcedDeleteTopicIds.clear()
+
+    updateSyncRuntimeState({
+      configured: true,
+      server,
+      tokenConfigured: Boolean(token),
+      configSource: source,
+      pullCursor: getPullCursor(server),
+      lastResult: null,
+      lastFailures: [],
+      lastError: null
+    })
+    logger.info(`Sync baseline rebuilt from local snapshot (${snapshot.size} topics)`)
   })
 
   // 预览服务端增量（只分析，不写本地）
@@ -1789,9 +2081,10 @@ async function start() {
       if (syncTimeout) {
         clearTimeout(syncTimeout)
       }
+      const debounceMs = getSyncIntervalMs()
       syncTimeout = setTimeout(() => {
         syncOnce()
-      }, SYNC_INTERVAL)
+      }, debounceMs)
     }
   })
 }
