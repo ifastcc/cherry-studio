@@ -16,7 +16,7 @@ import store from '@renderer/store'
 import { updateAssistants } from '@renderer/store/assistants'
 import type { Topic } from '@renderer/types'
 import type { Message as NewMessage, MessageBlock } from '@renderer/types/newMessage'
-import { MessageBlockStatus } from '@renderer/types/newMessage'
+import { AssistantMessageStatus, MessageBlockStatus, UserMessageStatus } from '@renderer/types/newMessage'
 
 const logger = loggerService.withContext('TopicSync')
 
@@ -443,17 +443,13 @@ interface TopicFullData {
   assistantName: string
   createdAt: string | null
   updatedAt: string | null
-  messages: Array<{
-    id: string
-    role: string
-    createdAt: string
-    status: string
-    model?: unknown
-    usage?: unknown
-    metrics?: unknown
-    mentions?: unknown
-    blocks: unknown[]
-  }>
+  messages: Array<
+    Record<string, unknown> & {
+      id: string
+      role: string
+      blocks: unknown[]
+    }
+  >
 }
 
 interface SyncActionResult {
@@ -589,17 +585,20 @@ async function getTopicFullData(topicId: string): Promise<TopicFullData | null> 
       assistantName: meta?.assistantName || '',
       createdAt: meta?.createdAt || null,
       updatedAt: meta?.updatedAt || null,
-      messages: messages.map((msg) => ({
-        id: msg.id,
-        role: msg.role,
-        createdAt: msg.createdAt,
-        status: msg.status,
-        model: msg.model,
-        usage: msg.usage,
-        metrics: msg.metrics,
-        mentions: msg.mentions,
-        blocks: (msg.blocks || []).map((bid) => blockMap.get(String(bid))).filter(Boolean)
-      }))
+      // Keep all message-level metadata (askId/modelId/multiModelMessageStyle/etc.)
+      // so sync pull will not break multi-model grouping or layout switching.
+      messages: messages.map((msg) => {
+        const messageRecord = msg as Record<string, unknown>
+        const { blocks: _ignoredBlocks, ...messageMeta } = messageRecord
+        return {
+          ...messageMeta,
+          id: msg.id,
+          role: msg.role,
+          createdAt: msg.createdAt,
+          status: msg.status,
+          blocks: (msg.blocks || []).map((bid) => blockMap.get(String(bid))).filter(Boolean)
+        }
+      })
     }
   } catch (e) {
     logger.error(`Failed to get topic data for ${topicId}`, e instanceof Error ? e : new Error(String(e)))
@@ -874,6 +873,25 @@ function toMessageBlockStatus(value: unknown): MessageBlockStatus {
   return MessageBlockStatus.SUCCESS
 }
 
+function toMessageStatus(value: unknown): NewMessage['status'] {
+  if (value === UserMessageStatus.SUCCESS) {
+    return value
+  }
+
+  if (
+    value === AssistantMessageStatus.PROCESSING ||
+    value === AssistantMessageStatus.PENDING ||
+    value === AssistantMessageStatus.SEARCHING ||
+    value === AssistantMessageStatus.SUCCESS ||
+    value === AssistantMessageStatus.PAUSED ||
+    value === AssistantMessageStatus.ERROR
+  ) {
+    return value
+  }
+
+  return AssistantMessageStatus.SUCCESS
+}
+
 function parseTimeMs(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) return value
   if (typeof value === 'string' && value.trim()) {
@@ -1078,8 +1096,7 @@ function normalizeIncomingTopic(
         ...(blockRecord as unknown as MessageBlock),
         id: blockId,
         messageId,
-        createdAt:
-          typeof blockRecord.createdAt === 'string' ? blockRecord.createdAt : toIsoString(messageRecord.createdAt),
+        createdAt: typeof blockRecord.createdAt === 'string' ? blockRecord.createdAt : toIsoString(blockRecord.createdAt),
         status: toMessageBlockStatus(blockRecord.status)
       }
 
@@ -1087,19 +1104,27 @@ function normalizeIncomingTopic(
       blockIds.push(blockId)
     }
 
-    return {
+    const { blocks: _incomingBlocks, ...messageMeta } = messageRecord
+
+    const normalizedMessage: NewMessage = {
+      ...(messageMeta as Partial<NewMessage>),
       id: messageId,
       role,
       assistantId,
       topicId: incoming.topicId,
-      createdAt: typeof messageRecord.createdAt === 'string' ? messageRecord.createdAt : now,
-      status: typeof messageRecord.status === 'string' ? messageRecord.status : 'success',
-      model: messageRecord.model,
-      usage: messageRecord.usage,
-      metrics: messageRecord.metrics,
+      createdAt: typeof messageRecord.createdAt === 'string' ? messageRecord.createdAt : toIsoString(messageRecord.createdAt),
+      updatedAt:
+        typeof messageRecord.updatedAt === 'string'
+          ? messageRecord.updatedAt
+          : messageRecord.updatedAt != null
+            ? toIsoString(messageRecord.updatedAt)
+            : undefined,
+      status: toMessageStatus(messageRecord.status),
       mentions: Array.isArray(messageRecord.mentions) ? messageRecord.mentions : undefined,
       blocks: blockIds
-    } as NewMessage
+    }
+
+    return normalizedMessage
   })
 
   const topicMeta: Topic = {
