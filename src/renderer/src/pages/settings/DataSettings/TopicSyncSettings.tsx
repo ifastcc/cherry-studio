@@ -435,6 +435,24 @@ const TopicSyncSettings: FC = () => {
     window.toast.success(t('settings.data.topic_sync.triggered', 'Manual sync triggered.'))
   }
 
+  const triggerFullPush = () => {
+    window.modal.confirm({
+      centered: true,
+      title: t('settings.data.topic_sync.full_push_title', 'Force Full Push to Server?'),
+      content: t(
+        'settings.data.topic_sync.full_push_content',
+        'This will clear local sync baseline and force-upload all local topics to the server.'
+      ),
+      okText: t('settings.data.topic_sync.full_push_confirm', 'Full Push'),
+      onOk: () => {
+        window.dispatchEvent(new Event('cherry-sync-push-full'))
+        window.toast.success(
+          t('settings.data.topic_sync.full_push_triggered', 'Full push triggered. Uploading all local topics...')
+        )
+      }
+    })
+  }
+
   const checkConnection = () => {
     window.dispatchEvent(new Event('cherry-sync-check'))
     window.toast.success(t('settings.data.topic_sync.checking', 'Checking connection...'))
@@ -795,6 +813,9 @@ const TopicSyncSettings: FC = () => {
           <ButtonRow>
             <Button type="primary" disabled={!canOperate} onClick={triggerSyncNow}>
               {t('settings.data.topic_sync.sync_now', 'Sync Now')}
+            </Button>
+            <Button danger disabled={!canOperate} onClick={triggerFullPush}>
+              {t('settings.data.topic_sync.full_push', 'Full Push')}
             </Button>
             <Button disabled={!canOperate} onClick={triggerPullPreview}>
               {t('settings.data.topic_sync.pull_preview', 'Preview Pull')}

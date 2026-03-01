@@ -52,17 +52,13 @@ jobs:
             fi
 
             echo "Latest upstream release tag: $TARGET_TAG"
-            if gh release view "$TARGET_TAG" > /dev/null 2>&1; then
-              echo "Release $TARGET_TAG already exists in this repo. Skipping."
-              echo "should_build=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/CherryHQ/cherry-studio.git || git remote set-url upstream https://github.com/CherryHQ/cherry-studio.git
-          git fetch upstream refs/tags/"$TARGET_TAG":refs/tags/"$TARGET_TAG"
+          git tag -d "$TARGET_TAG" >/dev/null 2>&1 || true
+          git fetch upstream +refs/tags/"$TARGET_TAG":refs/tags/"$TARGET_TAG"
           git checkout main
 
           # 将上游 release tag 合入 fork/main；保留本仓库 workflows
@@ -82,6 +78,12 @@ jobs:
             git push origin main
           fi
 
+          # 若本仓库已存在同名 tag，先删除，确保本次发布重新打新 tag 指向最新构建 commit
+          if git ls-remote --tags origin "refs/tags/$TARGET_TAG" | grep -q "$TARGET_TAG"; then
+            echo "Deleting existing remote tag: $TARGET_TAG"
+            git push origin ":refs/tags/$TARGET_TAG"
+          fi
+
           BUILD_SHA=$(git rev-parse HEAD)
           echo "should_build=true" >> $GITHUB_OUTPUT
           echo "tag=$TARGET_TAG" >> $GITHUB_OUTPUT
@@ -92,6 +94,8 @@ jobs:
     if: needs.sync_and_prepare.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
+      # 串行构建并保持顺序，优先构建 macOS
+      max-parallel: 1
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
       fail-fast: false
@@ -193,6 +197,7 @@ jobs:
         with:
           draft: false
           allowUpdates: true
+          replacesArtifacts: true
           makeLatest: true
           # 将 release tag 绑定到本次实际构建的 commit
           commit: ${{ needs.sync_and_prepare.outputs.build_ref }}

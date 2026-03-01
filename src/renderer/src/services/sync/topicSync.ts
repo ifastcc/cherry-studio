@@ -1895,6 +1895,46 @@ async function syncOnce(): Promise<void> {
   }
 }
 
+async function triggerFullPushToServer(): Promise<void> {
+  if (isSyncRunning) {
+    logger.verbose('Full push skipped: sync loop is running.')
+    return
+  }
+
+  const { server, token, source } = await getConfig()
+  if (!server) {
+    updateRuntimeConfig({ server, token, source })
+    logger.warn('Full push skipped: sync server is not configured.')
+    return
+  }
+
+  const currentSnapshot = getTopicSnapshotFromStore()
+
+  previousSnapshot = new Map()
+  previousSnapshotServer = server
+  savePersistedSnapshot(server, previousSnapshot)
+
+  forcedUpsertTopicIds.clear()
+  forcedDeleteTopicIds.clear()
+  for (const topicId of currentSnapshot.keys()) {
+    forcedUpsertTopicIds.add(topicId)
+  }
+
+  updateSyncRuntimeState({
+    configured: true,
+    server,
+    tokenConfigured: Boolean(token),
+    configSource: source,
+    pullCursor: getPullCursor(server),
+    lastResult: null,
+    lastFailures: [],
+    lastError: null
+  })
+
+  logger.info(`Full push queued (${currentSnapshot.size} topics).`)
+  await syncOnce()
+}
+
 // ── 启动 ──────────────────────────────────────────────────────────────
 
 async function start() {
@@ -1917,6 +1957,10 @@ async function start() {
   // 提供手动触发入口，供设置页调用
   window.addEventListener('cherry-sync-force', () => {
     syncOnce()
+  })
+
+  window.addEventListener('cherry-sync-push-full', () => {
+    triggerFullPushToServer()
   })
 
   // 提供连通性检查入口，供设置页调用
