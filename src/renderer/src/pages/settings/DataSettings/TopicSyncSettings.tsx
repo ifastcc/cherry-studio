@@ -453,6 +453,28 @@ const TopicSyncSettings: FC = () => {
     })
   }
 
+  const triggerFullPushPrune = () => {
+    window.modal.confirm({
+      centered: true,
+      title: t('settings.data.topic_sync.full_push_prune_title', 'Force Full Push and Prune Remote Data?'),
+      content: t(
+        'settings.data.topic_sync.full_push_prune_content',
+        'This will force-upload all local topics and delete topics that exist on server but not in local data. This action is destructive for remote data.'
+      ),
+      okText: t('settings.data.topic_sync.full_push_prune_confirm', 'Full Push + Prune'),
+      okButtonProps: { danger: true },
+      onOk: () => {
+        window.dispatchEvent(new Event('cherry-sync-push-full-prune'))
+        window.toast.success(
+          t(
+            'settings.data.topic_sync.full_push_prune_triggered',
+            'Full push + prune triggered. Uploading local topics and pruning remote extras...'
+          )
+        )
+      }
+    })
+  }
+
   const checkConnection = () => {
     window.dispatchEvent(new Event('cherry-sync-check'))
     window.toast.success(t('settings.data.topic_sync.checking', 'Checking connection...'))
@@ -816,6 +838,9 @@ const TopicSyncSettings: FC = () => {
             </Button>
             <Button danger disabled={!canOperate} onClick={triggerFullPush}>
               {t('settings.data.topic_sync.full_push', 'Full Push')}
+            </Button>
+            <Button danger disabled={!canOperate} onClick={triggerFullPushPrune}>
+              {t('settings.data.topic_sync.full_push_prune', 'Full Push + Prune')}
             </Button>
             <Button disabled={!canOperate} onClick={triggerPullPreview}>
               {t('settings.data.topic_sync.pull_preview', 'Preview Pull')}

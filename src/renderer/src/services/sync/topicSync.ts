@@ -855,6 +855,44 @@ async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActio
   return out
 }
 
+async function fetchServerTopicIds(server: string, token: string): Promise<string[]> {
+  const resp = await fetchWithTimeout(`${server}/api/topics`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  })
+
+  const text = await resp.text()
+  let decoded: unknown = null
+  try {
+    decoded = text ? JSON.parse(text) : null
+  } catch {
+    decoded = null
+  }
+
+  if (!resp.ok) {
+    logger.error(`GET /api/topics failed: ${resp.status} ${shortenResponseText(text)}`)
+    throw new Error(`list_http_${resp.status}`)
+  }
+
+  const root = isRecord(decoded) ? decoded : {}
+  const rawTopics = Array.isArray(root.topics) ? root.topics : []
+  const topicIds = new Set<string>()
+
+  for (const topic of rawTopics) {
+    if (!isRecord(topic)) continue
+    const topicId =
+      (typeof topic.topicId === 'string' && topic.topicId) ||
+      (typeof topic.topic_id === 'string' && topic.topic_id) ||
+      (typeof topic.id === 'string' && topic.id) ||
+      ''
+    if (topicId) topicIds.add(topicId)
+  }
+
+  return [...topicIds]
+}
+
 function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -1895,7 +1933,7 @@ async function syncOnce(): Promise<void> {
   }
 }
 
-async function triggerFullPushToServer(): Promise<void> {
+async function triggerFullPushToServer(options?: { pruneRemote?: boolean }): Promise<void> {
   if (isSyncRunning) {
     logger.verbose('Full push skipped: sync loop is running.')
     return
@@ -1909,6 +1947,7 @@ async function triggerFullPushToServer(): Promise<void> {
   }
 
   const currentSnapshot = getTopicSnapshotFromStore()
+  const pruneRemote = options?.pruneRemote === true
 
   previousSnapshot = new Map()
   previousSnapshotServer = server
@@ -1918,6 +1957,25 @@ async function triggerFullPushToServer(): Promise<void> {
   forcedDeleteTopicIds.clear()
   for (const topicId of currentSnapshot.keys()) {
     forcedUpsertTopicIds.add(topicId)
+  }
+
+  if (pruneRemote) {
+    try {
+      const remoteTopicIds = await fetchServerTopicIds(server, token)
+      const localTopicIds = new Set(currentSnapshot.keys())
+      for (const topicId of remoteTopicIds) {
+        if (!localTopicIds.has(topicId)) {
+          forcedDeleteTopicIds.add(topicId)
+        }
+      }
+    } catch (e) {
+      const error = e instanceof Error ? e : new Error(String(e))
+      logger.error('Full push + prune skipped: failed to fetch remote topic list', error)
+      updateSyncRuntimeState({
+        lastError: error.message
+      })
+      return
+    }
   }
 
   updateSyncRuntimeState({
@@ -1931,7 +1989,9 @@ async function triggerFullPushToServer(): Promise<void> {
     lastError: null
   })
 
-  logger.info(`Full push queued (${currentSnapshot.size} topics).`)
+  logger.info(
+    `Full push queued (${currentSnapshot.size} uploads, ${forcedDeleteTopicIds.size} remote deletes, prune=${pruneRemote ? 'on' : 'off'}).`
+  )
   await syncOnce()
 }
 
@@ -1961,6 +2021,10 @@ async function start() {
 
   window.addEventListener('cherry-sync-push-full', () => {
     triggerFullPushToServer()
+  })
+
+  window.addEventListener('cherry-sync-push-full-prune', () => {
+    triggerFullPushToServer({ pruneRemote: true })
   })
 
   // 提供连通性检查入口，供设置页调用
