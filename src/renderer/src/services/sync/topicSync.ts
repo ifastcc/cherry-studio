@@ -54,12 +54,13 @@ interface PullConflictItem {
   localUpdatedAt: number
   remoteUpdatedAt: number
   remoteClientUpdatedAt: number
-  reason: 'local_newer' | 'remote_timestamp_missing'
+  reason: 'local_newer' | 'remote_timestamp_missing' | 'local_deleted_pending'
 }
 
 interface PullSummary {
   total: number
   safe: number
+  skipped: number
   conflicts: number
   applied: number
   conflictResolvedLocal: number
@@ -127,7 +128,7 @@ const DEFAULT_SYNC_RUNTIME_STATE: SyncRuntimeState = {
   tokenConfigured: false,
   configSource: 'none',
   syncIntervalMs: DEFAULT_SYNC_INTERVAL_MS,
-  syncMode: 'push_only',
+  syncMode: 'auto_safe',
   conflictPolicy: 'local_wins',
   pullCursor: 0,
   connectionStatus: 'unknown',
@@ -169,6 +170,7 @@ interface ServerChangeItem {
 interface PullPlanItem {
   item: ServerChangeItem
   conflict: boolean
+  skip?: boolean
   localUpdatedAt: number
   remoteUpdatedAt: number
   remoteClientUpdatedAt: number
@@ -254,7 +256,7 @@ function getSyncMode(): SyncMode {
   if (isSyncMode(raw)) {
     return raw
   }
-  return 'push_only'
+  return 'auto_safe'
 }
 
 function getConflictPolicy(): ConflictPolicy {
@@ -443,6 +445,10 @@ interface TopicFullData {
   assistantName: string
   createdAt: string | null
   updatedAt: string | null
+  pinned?: boolean
+  prompt?: string
+  type?: string
+  isNameManuallyEdited?: boolean
   messages: Array<
     Record<string, unknown> & {
       id: string
@@ -464,6 +470,8 @@ interface SyncActionResult {
 // ── 状态 ──────────────────────────────────────────────────────────────
 
 const SNAPSHOT_KEY_PREFIX = 'cherry-sync-snapshot:' // localStorage key prefix for persisted snapshot
+const FORCED_WRITEBACK_KEY = 'cherry-sync-forced-writeback' // localStorage key for persisted forced write-back queue
+const STORE_CHANGE_DEBOUNCE_MS = 5_000 // debounce for Redux store changes (shorter than sync interval)
 
 function snapshotStorageKey(server: string): string {
   return `${SNAPSHOT_KEY_PREFIX}${server || 'default'}`
@@ -498,6 +506,45 @@ const forcedUpsertTopicIds = new Set<string>()
 const forcedDeleteTopicIds = new Set<string>()
 const TERMINAL_STATUSES = new Set<SyncActionStatus>(['applied', 'noop', 'stale', 'not_found'])
 
+/** 从 localStorage 恢复 forced 回写队列（防止 cursor 推进后 app 崩溃丢失队列） */
+function loadPersistedForcedWriteBack(): void {
+  try {
+    const raw = localStorage.getItem(FORCED_WRITEBACK_KEY)
+    if (!raw) return
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return
+    const upserts = Array.isArray(parsed.upserts) ? parsed.upserts : []
+    const deletes = Array.isArray(parsed.deletes) ? parsed.deletes : []
+    for (const id of upserts) {
+      if (typeof id === 'string' && id) forcedUpsertTopicIds.add(id)
+    }
+    for (const id of deletes) {
+      if (typeof id === 'string' && id) forcedDeleteTopicIds.add(id)
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/** 将 forced 回写队列持久化到 localStorage */
+function savePersistedForcedWriteBack(): void {
+  try {
+    if (forcedUpsertTopicIds.size === 0 && forcedDeleteTopicIds.size === 0) {
+      localStorage.removeItem(FORCED_WRITEBACK_KEY)
+      return
+    }
+    localStorage.setItem(
+      FORCED_WRITEBACK_KEY,
+      JSON.stringify({
+        upserts: [...forcedUpsertTopicIds],
+        deletes: [...forcedDeleteTopicIds]
+      })
+    )
+  } catch {
+    // localStorage 满了之类的极端情况，忽略
+  }
+}
+
 // ── 工具函数 ──────────────────────────────────────────────────────────
 
 /** 从 Redux Store 提取 Topic 元数据快照（完全消除 localStorage parse 的性能问题） */
@@ -528,6 +575,10 @@ function getTopicMeta(topicId: string): {
   assistantName: string
   createdAt: string | null
   updatedAt: string | null
+  pinned?: boolean
+  prompt?: string
+  type?: string
+  isNameManuallyEdited?: boolean
 } | null {
   try {
     const state = store.getState()
@@ -541,7 +592,11 @@ function getTopicMeta(topicId: string): {
           assistantId: assistant.id || null,
           assistantName: assistant.name || '',
           createdAt: found.createdAt || null,
-          updatedAt: found.updatedAt || null
+          updatedAt: found.updatedAt || null,
+          pinned: found.pinned || undefined,
+          prompt: found.prompt || undefined,
+          type: found.type || undefined,
+          isNameManuallyEdited: found.isNameManuallyEdited || undefined
         }
       }
     }
@@ -560,15 +615,19 @@ async function getTopicFullData(topicId: string): Promise<TopicFullData | null> 
     const messages = topic.messages || []
     if (messages.length === 0) {
       const meta = getTopicMeta(topicId)
-      return {
-        topicId,
-        name: meta?.name || '未命名',
-        assistantId: meta?.assistantId || null,
-        assistantName: meta?.assistantName || '',
-        createdAt: meta?.createdAt || null,
-        updatedAt: meta?.updatedAt || null,
-        messages: []
-      }
+    return {
+      topicId,
+      name: meta?.name || '未命名',
+      assistantId: meta?.assistantId || null,
+      assistantName: meta?.assistantName || '',
+      createdAt: meta?.createdAt || null,
+      updatedAt: meta?.updatedAt || null,
+      pinned: meta?.pinned,
+      prompt: meta?.prompt,
+      type: meta?.type,
+      isNameManuallyEdited: meta?.isNameManuallyEdited,
+      messages: []
+    }
     }
 
     // 批量获取所有相关的 message blocks
@@ -585,6 +644,10 @@ async function getTopicFullData(topicId: string): Promise<TopicFullData | null> 
       assistantName: meta?.assistantName || '',
       createdAt: meta?.createdAt || null,
       updatedAt: meta?.updatedAt || null,
+      pinned: meta?.pinned,
+      prompt: meta?.prompt,
+      type: meta?.type,
+      isNameManuallyEdited: meta?.isNameManuallyEdited,
       // Keep all message-level metadata (askId/modelId/multiModelMessageStyle/etc.)
       // so sync pull will not break multi-model grouping or layout switching.
       messages: messages.map((msg) => {
@@ -1038,21 +1101,48 @@ function cloneAssistantsForUpdate(): any[] {
   }))
 }
 
-function resolveAssistantId(assistants: any[], incoming: TopicFullData): string {
+function resolveAssistantId(
+  assistants: any[],
+  incoming: TopicFullData
+): { assistantId: string; createdAssistant: boolean } {
   if (incoming.assistantId && assistants.some((assistant) => assistant.id === incoming.assistantId)) {
-    return incoming.assistantId
+    return { assistantId: incoming.assistantId, createdAssistant: false }
   }
 
   if (incoming.assistantName) {
     const byName = assistants.find((assistant) => assistant.name === incoming.assistantName)
-    if (byName?.id) return byName.id
+    if (byName?.id) return { assistantId: byName.id, createdAssistant: false }
+  }
+
+  const incomingAssistantId = typeof incoming.assistantId === 'string' ? incoming.assistantId.trim() : ''
+  const incomingAssistantName = typeof incoming.assistantName === 'string' ? incoming.assistantName.trim() : ''
+  if (incomingAssistantId) {
+    const template = store.getState().assistants?.defaultAssistant
+    const nextAssistant = template
+      ? {
+          ...template,
+          id: incomingAssistantId,
+          name: incomingAssistantName || `Synced ${incomingAssistantId.slice(0, 8)}`,
+          topics: [],
+          messages: Array.isArray(template.messages) ? [...template.messages] : [],
+          regularPhrases: Array.isArray(template.regularPhrases) ? [...template.regularPhrases] : [],
+          settings: template.settings ? { ...template.settings } : template.settings
+        }
+      : {
+          id: incomingAssistantId,
+          name: incomingAssistantName || incomingAssistantId,
+          topics: []
+        }
+
+    assistants.push(nextAssistant)
+    return { assistantId: incomingAssistantId, createdAssistant: true }
   }
 
   const defaultAssistantId = store.getState().assistants?.defaultAssistant?.id
-  if (defaultAssistantId) return defaultAssistantId
-  if (assistants[0]?.id) return assistants[0].id
+  if (defaultAssistantId) return { assistantId: defaultAssistantId, createdAssistant: false }
+  if (assistants[0]?.id) return { assistantId: assistants[0].id, createdAssistant: false }
 
-  return incoming.assistantId || 'default'
+  return { assistantId: incoming.assistantId || 'default', createdAssistant: false }
 }
 
 function upsertTopicMetaInAssistants(assistants: any[], assistantId: string, topicMeta: Topic): boolean {
@@ -1105,8 +1195,8 @@ function normalizeIncomingTopic(
   assistantId: string
 ): { topicMeta: Topic; messages: NewMessage[]; blocks: MessageBlock[] } {
   const now = new Date().toISOString()
-  const createdAt = typeof incoming.createdAt === 'string' && incoming.createdAt ? incoming.createdAt : now
-  const updatedAt = typeof incoming.updatedAt === 'string' && incoming.updatedAt ? incoming.updatedAt : createdAt
+  const createdAt = incoming.createdAt != null ? toIsoString(incoming.createdAt) : now
+  const updatedAt = incoming.updatedAt != null ? toIsoString(incoming.updatedAt) : createdAt
 
   const blockMap = new Map<string, MessageBlock>()
   const messages: NewMessage[] = (Array.isArray(incoming.messages) ? incoming.messages : []).map((message, index) => {
@@ -1171,7 +1261,11 @@ function normalizeIncomingTopic(
     name: incoming.name || '未命名',
     createdAt,
     updatedAt,
-    messages: []
+    messages: [],
+    ...(incoming.pinned != null ? { pinned: incoming.pinned } : {}),
+    ...(incoming.prompt != null ? { prompt: incoming.prompt } : {}),
+    ...(incoming.type != null ? { type: incoming.type as Topic['type'] } : {}),
+    ...(incoming.isNameManuallyEdited != null ? { isNameManuallyEdited: incoming.isNameManuallyEdited } : {})
   }
 
   return {
@@ -1232,6 +1326,22 @@ function buildPullPlan(items: ServerChangeItem[]): PullPlanItem[] {
 
   for (const item of items) {
     const localMarker = snapshot.get(item.topicId)
+    const baselineMarker = previousSnapshot?.get(item.topicId)
+
+    // Local topic was deleted after last baseline but not pushed yet.
+    // Treat remote upsert as conflict to avoid resurrecting locally deleted topics.
+    if (localMarker === undefined && baselineMarker !== undefined && item.op === 'upsert') {
+      plan.push({
+        item,
+        conflict: true,
+        localUpdatedAt: parseTimeMs(baselineMarker),
+        remoteUpdatedAt: Number(item.updatedAt || 0),
+        remoteClientUpdatedAt: Number(item.clientUpdatedAt || 0),
+        reason: 'local_deleted_pending'
+      })
+      continue
+    }
+
     if (localMarker === undefined) {
       plan.push({
         item,
@@ -1247,6 +1357,21 @@ function buildPullPlan(items: ServerChangeItem[]): PullPlanItem[] {
     const remoteClientTs = Number(item.clientUpdatedAt || 0)
     const remoteUpdatedTs = Number(item.updatedAt || 0)
     const remoteTs = Number(item.clientUpdatedAt || item.updatedAt || 0)
+
+    // 自己推送的数据被拉回来：本地时间戳与服务端记录的 clientUpdatedAt 完全一致
+    // 跳过以避免无意义地覆写 IndexedDB（特别是用户可能正在编辑该 topic）
+    if (remoteClientTs > 0 && localTs === remoteClientTs && item.op === 'upsert') {
+      plan.push({
+        item,
+        conflict: false,
+        skip: true,
+        localUpdatedAt: localTs,
+        remoteUpdatedAt: remoteUpdatedTs,
+        remoteClientUpdatedAt: remoteClientTs
+      })
+      continue
+    }
+
     const conflict = remoteTs <= 0 ? true : localTs > remoteTs + 1000
     const reason: PullConflictItem['reason'] | undefined =
       remoteTs <= 0 ? 'remote_timestamp_missing' : conflict ? 'local_newer' : undefined
@@ -1292,6 +1417,8 @@ function queueWriteBackFromLocalWins(topicIds: Iterable<string>): number {
     queued += 1
   }
 
+  // 立即持久化，防止 cursor 已推进但 app 崩溃时丢失队列
+  savePersistedForcedWriteBack()
   return queued
 }
 
@@ -1352,8 +1479,9 @@ async function pullFromServer({
 
     const fetched = await fetchAllServerChanges(server, token, cursor)
     const plan = buildPullPlan(fetched.items)
-    const safe = plan.filter((entry) => !entry.conflict).length
-    const conflicts = plan.length - safe
+    const skipped = plan.filter((entry) => entry.skip).length
+    const safe = plan.filter((entry) => !entry.conflict && !entry.skip).length
+    const conflicts = plan.filter((entry) => entry.conflict).length
     const firstConflictSeq = plan.find((entry) => entry.conflict)?.item.seq ?? null
     const allConflictItems = plan.filter((entry) => entry.conflict).map(toConflictItem)
 
@@ -1370,10 +1498,20 @@ async function pullFromServer({
 
     if (applySafe) {
       for (const entry of plan) {
+        // 跳过自己推送后被拉回的未变更条目（noop）
+        if (entry.skip) {
+          // skip 条目只在冲突 seq 之前推进 cursor，避免跳过冲突
+          if (!blockedSeq) {
+            lastAppliedSeq = entry.item.seq
+          }
+          continue
+        }
+
         if (entry.conflict) {
           if (conflictStrategy === 'stop') {
-            blockedSeq = entry.item.seq
-            break
+            // 记录冲突——cursor 不再向前推进，下次 pull 会重新拉取冲突及之后的条目
+            if (!blockedSeq) blockedSeq = entry.item.seq
+            continue
           }
 
           if (conflictStrategy === 'local_wins') {
@@ -1383,6 +1521,10 @@ async function pullFromServer({
             continue
           }
         }
+
+        // stop 策略下，冲突之后的安全条目仍然处理，但不推进 cursor
+        // 这样下次 pull 会从冲突 seq 重新开始，已处理的安全条目会被 skip（noop）
+        const canAdvanceCursor = !blockedSeq
 
         if (entry.item.op === 'delete') {
           await applyDeleteToDb(entry.item.topicId)
@@ -1394,16 +1536,20 @@ async function pullFromServer({
           if (entry.conflict) {
             resolvedServer += 1
           }
-          lastAppliedSeq = entry.item.seq
+          if (canAdvanceCursor) lastAppliedSeq = entry.item.seq
           continue
         }
 
         if (!entry.item.topic) {
-          blockedSeq = entry.item.seq
-          break
+          if (!blockedSeq) blockedSeq = entry.item.seq
+          continue
         }
 
-        const targetAssistantId = resolveAssistantId(assistants, entry.item.topic)
+        const resolvedAssistant = resolveAssistantId(assistants, entry.item.topic)
+        if (resolvedAssistant.createdAssistant) {
+          assistantsChanged = true
+        }
+        const targetAssistantId = resolvedAssistant.assistantId
         const normalized = normalizeIncomingTopic(entry.item.topic, targetAssistantId)
         await applyUpsertToDb(entry.item.topic.topicId, normalized.messages, normalized.blocks)
 
@@ -1420,11 +1566,22 @@ async function pullFromServer({
         if (entry.conflict) {
           resolvedServer += 1
         }
-        lastAppliedSeq = entry.item.seq
+        if (canAdvanceCursor) lastAppliedSeq = entry.item.seq
       }
 
       if (assistantsChanged) {
-        store.dispatch(updateAssistants(assistants))
+        try {
+          store.dispatch(updateAssistants(assistants))
+        } catch (dispatchErr) {
+          // Redux dispatch 失败——DB 已写入但 assistant 状态未更新
+          // 回退 cursor 使下次 pull 重新处理，DB 写入是幂等的
+          logger.error(
+            'Failed to dispatch updateAssistants, cursor will not advance',
+            dispatchErr instanceof Error ? dispatchErr : new Error(String(dispatchErr))
+          )
+          lastAppliedSeq = cursor
+          blockedSeq = blockedSeq ?? lastAppliedSeq
+        }
       }
 
       if (localWinsCandidates.size > 0) {
@@ -1432,7 +1589,8 @@ async function pullFromServer({
       }
     }
 
-    const nextCursor = applySafe ? (blockedSeq ? lastAppliedSeq : fetched.nextCursor) : cursor
+    // 有冲突时 cursor 推进到最后一个已处理的 safe seq（跳过冲突），无冲突时推到服务端返回的末尾
+    const nextCursor = applySafe ? (blockedSeq ? Math.max(lastAppliedSeq, cursor) : fetched.nextCursor) : cursor
     if (applySafe) {
       setPullCursor(server, nextCursor)
       applyPullToSnapshot(server, appliedForSnapshot)
@@ -1447,6 +1605,7 @@ async function pullFromServer({
     const summary: PullSummary = {
       total: plan.length,
       safe,
+      skipped,
       conflicts,
       applied: appliedCount,
       conflictResolvedLocal: resolvedLocal,
@@ -1906,6 +2065,8 @@ async function syncOnce(): Promise<void> {
     // 更新快照（内存 + 持久化）
     previousSnapshot = nextSnapshot
     savePersistedSnapshot(server, nextSnapshot)
+    // 推送完成后持久化 forced 队列（已成功的条目已从 Set 中删除）
+    savePersistedForcedWriteBack()
   } catch (e) {
     const error = e instanceof Error ? e : new Error(String(e))
     logger.error('Sync loop error', error)
@@ -1958,6 +2119,7 @@ async function triggerFullPushToServer(options?: { pruneRemote?: boolean }): Pro
   for (const topicId of currentSnapshot.keys()) {
     forcedUpsertTopicIds.add(topicId)
   }
+  savePersistedForcedWriteBack()
 
   if (pruneRemote) {
     try {
@@ -2000,6 +2162,9 @@ async function triggerFullPushToServer(options?: { pruneRemote?: boolean }): Pro
 async function start() {
   if (hasStarted) return
   hasStarted = true
+
+  // 恢复上次未完成的 forced 回写队列
+  loadPersistedForcedWriteBack()
 
   const { server } = await getConfig()
   const intervalMs = getSyncIntervalMs()
@@ -2115,6 +2280,7 @@ async function start() {
     savePersistedSnapshot(server, previousSnapshot)
     forcedUpsertTopicIds.clear()
     forcedDeleteTopicIds.clear()
+    savePersistedForcedWriteBack()
 
     updateSyncRuntimeState({
       configured: true,
@@ -2214,10 +2380,9 @@ async function start() {
       if (syncTimeout) {
         clearTimeout(syncTimeout)
       }
-      const debounceMs = getSyncIntervalMs()
       syncTimeout = setTimeout(() => {
         syncOnce()
-      }, debounceMs)
+      }, STORE_CHANGE_DEBOUNCE_MS)
     }
   })
 }

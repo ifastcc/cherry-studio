@@ -38,12 +38,13 @@ interface PullConflictItem {
   localUpdatedAt: number
   remoteUpdatedAt: number
   remoteClientUpdatedAt: number
-  reason: 'local_newer' | 'remote_timestamp_missing'
+  reason: 'local_newer' | 'remote_timestamp_missing' | 'local_deleted_pending'
 }
 
 interface PullSummary {
   total: number
   safe: number
+  skipped: number
   conflicts: number
   applied: number
   conflictResolvedLocal: number
@@ -286,9 +287,10 @@ function formatPullSummary(summary: PullSummary | null): string {
     summary.conflictResolvedLocal > 0 || summary.conflictResolvedServer > 0 || summary.writeBackQueued > 0
       ? `, resolve(local=${summary.conflictResolvedLocal}, server=${summary.conflictResolvedServer}, writeBack=${summary.writeBackQueued})`
       : ''
+  const skipped = summary.skipped > 0 ? `, skipped=${summary.skipped}` : ''
   return (
     `total=${summary.total}, safe=${summary.safe}, conflicts=${summary.conflicts}, ` +
-    `applied=${summary.applied}, cursor=${summary.nextCursor}${blocked}${resolved}`
+    `applied=${summary.applied}, cursor=${summary.nextCursor}${blocked}${resolved}${skipped}`
   )
 }
 
