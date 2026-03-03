@@ -81,7 +81,11 @@ jobs:
             git push origin main
           fi
 
-          # 若本仓库已存在同名 tag，先删除，确保本次发布重新打新 tag 指向最新构建 commit
+          # 若本仓库已存在同名 release/tag，先删除，确保本次发布重新打包
+          if gh release view "$TARGET_TAG" &>/dev/null; then
+            echo "Deleting existing release: $TARGET_TAG"
+            gh release delete "$TARGET_TAG" --yes
+          fi
           if git ls-remote --tags origin "refs/tags/$TARGET_TAG" | grep -q "$TARGET_TAG"; then
             echo "Deleting existing remote tag: $TARGET_TAG"
             git push origin ":refs/tags/$TARGET_TAG"

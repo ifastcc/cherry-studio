@@ -1032,7 +1032,7 @@ async function fetchServerChanges(
   server: string,
   token: string,
   cursor: number
-): Promise<{ items: ServerChangeItem[]; nextCursor: number; hasMore: boolean }> {
+): Promise<{ items: ServerChangeItem[]; nextCursor: number; hasMore: boolean; oldestAvailableSeq: number }> {
   const resp = await fetchWithTimeout(
     `${server}/api/sync/changes?cursor=${cursor}&limit=${PULL_PAGE_LIMIT}&includePayload=1`,
     {
@@ -1060,11 +1060,13 @@ async function fetchServerChanges(
   const items = rawItems.map(parseServerChangeItem).filter(Boolean) as ServerChangeItem[]
   const nextCursor = Number(root.nextCursor ?? cursor)
   const hasMore = root.hasMore === true
+  const oldestAvailableSeq = Number(root.oldestAvailableSeq ?? 0)
 
   return {
     items,
     nextCursor: Number.isFinite(nextCursor) ? nextCursor : cursor,
-    hasMore
+    hasMore,
+    oldestAvailableSeq: Number.isFinite(oldestAvailableSeq) ? oldestAvailableSeq : 0
   }
 }
 
@@ -1072,10 +1074,11 @@ async function fetchAllServerChanges(
   server: string,
   token: string,
   cursor: number
-): Promise<{ items: ServerChangeItem[]; nextCursor: number }> {
+): Promise<{ items: ServerChangeItem[]; nextCursor: number; oldestAvailableSeq: number }> {
   const items: ServerChangeItem[] = []
   let currentCursor = cursor
   let pages = 0
+  let oldestAvailableSeq = 0
 
   while (pages < 50 && items.length < MAX_PULL_ITEMS) {
     const page = await fetchServerChanges(server, token, currentCursor)
@@ -1083,13 +1086,19 @@ async function fetchAllServerChanges(
     items.push(...page.items)
     currentCursor = page.nextCursor
 
+    // 只取首页返回的 oldestAvailableSeq（后续分页值相同）
+    if (pages === 1) {
+      oldestAvailableSeq = page.oldestAvailableSeq
+    }
+
     if (!page.hasMore) break
     if (page.items.length === 0) break
   }
 
   return {
     items: items.slice(0, MAX_PULL_ITEMS),
-    nextCursor: currentCursor
+    nextCursor: currentCursor,
+    oldestAvailableSeq
   }
 }
 
@@ -1477,7 +1486,20 @@ async function pullFromServer({
     const cursor = getPullCursor(server)
     updateRuntimeConfig({ server, token, source })
 
-    const fetched = await fetchAllServerChanges(server, token, cursor)
+    let fetched = await fetchAllServerChanges(server, token, cursor)
+
+    // 检测 cursor 是否落入已 purge 的空洞：
+    // 如果 cursor > 0 且小于服务端最小可用 seq，说明部分变更已被清理，
+    // 需要重置 cursor 从头拉取以避免静默丢失数据
+    if (cursor > 0 && fetched.oldestAvailableSeq > 0 && cursor < fetched.oldestAvailableSeq) {
+      logger.warn(
+        `Pull cursor ${cursor} is stale (oldest available seq=${fetched.oldestAvailableSeq}). ` +
+          'Resetting cursor to 0 for full re-sync.'
+      )
+      setPullCursor(server, 0)
+      fetched = await fetchAllServerChanges(server, token, 0)
+    }
+
     const plan = buildPullPlan(fetched.items)
     const skipped = plan.filter((entry) => entry.skip).length
     const safe = plan.filter((entry) => !entry.conflict && !entry.skip).length
