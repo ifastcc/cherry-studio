@@ -293,19 +293,6 @@ function saveSyncedRevisions(server: string, revisions: Map<string, number>): vo
   }
 }
 
-function updateSyncedRevision(server: string, topicId: string, revision: number): void {
-  const revisions = loadSyncedRevisions(server)
-  revisions.set(topicId, revision)
-  saveSyncedRevisions(server, revisions)
-}
-
-function removeSyncedRevision(server: string, topicId: string): void {
-  const revisions = loadSyncedRevisions(server)
-  if (revisions.delete(topicId)) {
-    saveSyncedRevisions(server, revisions)
-  }
-}
-
 // ── Dirty Topics 存储层 ─────────────────────────────────────────────
 
 function dirtyTopicsKey(server: string): string {
@@ -339,13 +326,6 @@ function markTopicDirty(server: string, topicId: string): void {
   const ids = loadDirtyTopicIds(server)
   ids.add(topicId)
   saveDirtyTopicIds(server, ids)
-}
-
-function markTopicClean(server: string, topicId: string): void {
-  const ids = loadDirtyTopicIds(server)
-  if (ids.delete(topicId)) {
-    saveDirtyTopicIds(server, ids)
-  }
 }
 
 // ── 连通性检查 ──────────────────────────────────────────────────────

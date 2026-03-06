@@ -112,22 +112,49 @@ jobs:
           git fetch upstream "+refs/tags/${TARGET_TAG}:refs/tags/${TARGET_TAG}"
 
           MERGE_STARTED="false"
+          MERGE_FAILED="false"
           if git merge "refs/tags/${TARGET_TAG}" --no-commit --no-ff --allow-unrelated-histories; then
             if [ -f .git/MERGE_HEAD ]; then
               MERGE_STARTED="true"
             fi
           else
-            if git ls-files -u | grep -q .; then
-              echo "::error::Merge conflicts detected when syncing ${TARGET_TAG}. Please resolve manually."
-            else
-              echo "::error::Merge failed unexpectedly while syncing ${TARGET_TAG}."
+            MERGE_FAILED="true"
+            if [ -f .git/MERGE_HEAD ]; then
+              MERGE_STARTED="true"
             fi
-            git merge --abort || true
-            exit 1
+          fi
+
+          if [ "$MERGE_FAILED" = "true" ]; then
+            if ! git diff --name-only --diff-filter=U | grep -q .; then
+              echo "::error::Merge failed unexpectedly while syncing ${TARGET_TAG}."
+              git merge --abort || true
+              exit 1
+            fi
+
+            while IFS= read -r conflict_file; do
+              case "$conflict_file" in
+                .github/workflows/*|electron-builder.yml)
+                  git checkout --ours -- "$conflict_file"
+                  git add "$conflict_file"
+                  echo "Auto-resolved ${conflict_file} using fork version."
+                  ;;
+                *)
+                  echo "::warning::Unresolved conflict remains in ${conflict_file}"
+                  ;;
+              esac
+            done < <(git diff --name-only --diff-filter=U)
+
+            if git diff --name-only --diff-filter=U | grep -q .; then
+              echo "::error::Merge conflicts remain after auto-resolution when syncing ${TARGET_TAG}."
+              git diff --name-only --diff-filter=U
+              git merge --abort || true
+              exit 1
+            fi
           fi
 
           if [ "$MERGE_STARTED" = "true" ]; then
-            git restore --source=HEAD --staged --worktree .github/workflows/ || true
+            git restore --source=HEAD --staged --worktree .github/workflows/ electron-builder.yml || true
+            git add .github/workflows electron-builder.yml
             git commit --allow-empty -m "chore: sync upstream ${TARGET_TAG} (preserve workflows)"
             git push origin HEAD:main
           else
