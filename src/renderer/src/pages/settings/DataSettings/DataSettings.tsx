@@ -632,7 +632,6 @@ const DataSettings: FC = () => {
                   </Button>
                 </HStack>
               </SettingRow>
-              <SettingDivider />
             </SettingGroup>
             <SettingGroup theme={theme}>
               <SettingTitle>{t('settings.data.data.title')}</SettingTitle>
