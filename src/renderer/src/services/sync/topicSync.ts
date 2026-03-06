@@ -1,9 +1,10 @@
 /**
- * Cherry Studio → Sync Server 增量推送
+ * Cherry Studio → Sync Server 基于 Manifest 的双向同步
  *
  * 零侵入设计：只需在 entryPoint.tsx 中 import 此文件即可启用同步。
- * 逻辑：按配置的同步间隔轮询，对比 Topic 快照（ID + updatedAt），
- *        将新增/更新/删除的 Topic 推送到同步服务器。
+ * 核心：基于服务端 manifest（topicId → revision 清单）做协调，
+ *        本地维护 syncedRevisions + dirty 集合替代旧的 snapshot diff。
+ *        cursor 降级为可选优化保留。
  *
  * 配置方式（优先级从高到低）：
  *   1. localStorage（运行时覆盖，设置页中写入）：
@@ -30,8 +31,7 @@ const INIT_DELAY = 8_000 // 初始化延迟（等 Dexie + Redux persist 准备�
 const REQUEST_TIMEOUT = 15_000
 const CONFIG_CACHE_TTL = 30_000
 const CONNECTIVITY_CACHE_TTL = 10_000
-const MAX_PULL_ITEMS = 1000
-const PULL_PAGE_LIMIT = 200
+const BATCH_GET_THRESHOLD = 5 // 超过此数量使用 batch-get 替代逐个 GET
 const SYNC_SERVER_KEY = 'cherry-sync-server'
 const SYNC_TOKEN_KEY = 'cherry-sync-token'
 const SYNC_RUNTIME_KEY = 'cherry-sync-runtime'
@@ -39,41 +39,14 @@ const SYNC_MODE_KEY = 'cherry-sync-mode'
 const SYNC_CONFLICT_POLICY_KEY = 'cherry-sync-conflict-policy'
 const SYNC_INTERVAL_KEY = 'cherry-sync-interval-ms'
 const PULL_CURSOR_KEY_PREFIX = 'cherry-sync-pull-cursor:'
+const SYNCED_REVISIONS_KEY_PREFIX = 'cherry-sync-revisions:'
+const DIRTY_TOPICS_KEY_PREFIX = 'cherry-sync-dirty-topics:'
 
 type ConfigSource = 'localStorage' | 'none'
 type ConnectionStatus = 'unknown' | 'online' | 'offline' | 'unauthorized'
 type SyncMode = 'push_only' | 'manual_pull' | 'auto_safe' | 'auto_full'
 type ConflictPolicy = 'local_wins' | 'server_wins'
-type PullConflictStrategy = 'stop' | ConflictPolicy
 type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'conflict' | 'not_found' | 'error'
-
-interface PullConflictItem {
-  seq: number
-  topicId: string
-  op: 'upsert' | 'delete'
-  localUpdatedAt: number
-  remoteUpdatedAt: number
-  remoteClientUpdatedAt: number
-  reason: 'local_newer' | 'remote_timestamp_missing' | 'local_deleted_pending'
-}
-
-interface PullSummary {
-  total: number
-  safe: number
-  skipped: number
-  conflicts: number
-  applied: number
-  conflictResolvedLocal: number
-  conflictResolvedServer: number
-  writeBackQueued: number
-  nextCursor: number
-  blockedSeq: number | null
-}
-
-interface PullExecutionResult {
-  summary: PullSummary
-  pendingConflicts: PullConflictItem[]
-}
 
 interface SyncRuntimeResult {
   added: number
@@ -82,6 +55,7 @@ interface SyncRuntimeResult {
   applied: number
   noop: number
   stale: number
+  conflict: number
   failed: number
 }
 
@@ -93,7 +67,7 @@ interface SyncFailureItem {
 }
 
 interface SyncProgressState {
-  phase: 'idle' | 'pull' | 'push_upsert' | 'push_delete'
+  phase: 'idle' | 'pull' | 'push_upsert' | 'push_delete' | 'manifest'
   total: number
   processed: number
   failed: number
@@ -114,8 +88,6 @@ interface SyncRuntimeState {
   lastSyncAt: number | null
   lastPullAt: number | null
   lastHttpStatus: number | null
-  lastPullSummary: PullSummary | null
-  pendingConflicts: PullConflictItem[]
   lastResult: SyncRuntimeResult | null
   lastFailures: SyncFailureItem[]
   syncProgress: SyncProgressState
@@ -137,8 +109,6 @@ const DEFAULT_SYNC_RUNTIME_STATE: SyncRuntimeState = {
   lastSyncAt: null,
   lastPullAt: null,
   lastHttpStatus: null,
-  lastPullSummary: null,
-  pendingConflicts: [],
   lastResult: null,
   lastFailures: [],
   syncProgress: {
@@ -157,25 +127,18 @@ interface ConnectivityProbeResult {
   httpStatus: number | null
 }
 
-interface ServerChangeItem {
-  seq: number
-  topicId: string
-  op: 'upsert' | 'delete'
+interface ManifestEntry {
   revision: number
-  updatedAt: number
-  clientUpdatedAt: number
-  topic?: TopicFullData
+  deletedAt: number | null
 }
 
-interface PullPlanItem {
-  item: ServerChangeItem
-  conflict: boolean
-  skip?: boolean
-  localUpdatedAt: number
-  remoteUpdatedAt: number
-  remoteClientUpdatedAt: number
-  reason?: PullConflictItem['reason']
+interface ManifestResponse {
+  changeSeq: number
+  topicCount: number
+  entries: Record<string, ManifestEntry>
 }
+
+// ── 配置与运行时状态 ─────────────────────────────────────────────────
 
 let cachedServer = ''
 let cachedToken = ''
@@ -196,8 +159,6 @@ function getSyncRuntimeState(): SyncRuntimeState {
     return {
       ...DEFAULT_SYNC_RUNTIME_STATE,
       ...parsed,
-      pendingConflicts: Array.isArray(parsed.pendingConflicts) ? [...parsed.pendingConflicts] : [],
-      lastPullSummary: parsed.lastPullSummary ? { ...parsed.lastPullSummary } : null,
       lastResult: parsed.lastResult ? { ...parsed.lastResult } : null,
       lastFailures: Array.isArray(parsed.lastFailures) ? [...parsed.lastFailures] : [],
       syncProgress: parsed.syncProgress
@@ -296,6 +257,98 @@ function setPullCursor(server: string, cursor: number): void {
   const safeCursor = Number.isFinite(cursor) && cursor >= 0 ? Math.floor(cursor) : 0
   localStorage.setItem(getPullCursorKey(server), String(safeCursor))
 }
+
+// ── Synced Revisions 存储层 ──────────────────────────────────────────
+
+function syncedRevisionsKey(server: string): string {
+  return `${SYNCED_REVISIONS_KEY_PREFIX}${server || 'default'}`
+}
+
+function loadSyncedRevisions(server: string): Map<string, number> {
+  try {
+    const raw = localStorage.getItem(syncedRevisionsKey(server))
+    if (!raw) return new Map()
+    const obj = JSON.parse(raw) as Record<string, number>
+    const map = new Map<string, number>()
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        map.set(k, v)
+      }
+    }
+    return map
+  } catch {
+    return new Map()
+  }
+}
+
+function saveSyncedRevisions(server: string, revisions: Map<string, number>): void {
+  try {
+    const obj: Record<string, number> = {}
+    for (const [k, v] of revisions) {
+      obj[k] = v
+    }
+    localStorage.setItem(syncedRevisionsKey(server), JSON.stringify(obj))
+  } catch {
+    // ignore
+  }
+}
+
+function updateSyncedRevision(server: string, topicId: string, revision: number): void {
+  const revisions = loadSyncedRevisions(server)
+  revisions.set(topicId, revision)
+  saveSyncedRevisions(server, revisions)
+}
+
+function removeSyncedRevision(server: string, topicId: string): void {
+  const revisions = loadSyncedRevisions(server)
+  if (revisions.delete(topicId)) {
+    saveSyncedRevisions(server, revisions)
+  }
+}
+
+// ── Dirty Topics 存储层 ─────────────────────────────────────────────
+
+function dirtyTopicsKey(server: string): string {
+  return `${DIRTY_TOPICS_KEY_PREFIX}${server || 'default'}`
+}
+
+function loadDirtyTopicIds(server: string): Set<string> {
+  try {
+    const raw = localStorage.getItem(dirtyTopicsKey(server))
+    if (!raw) return new Set()
+    const arr = JSON.parse(raw) as string[]
+    return new Set(arr.filter((id) => typeof id === 'string' && id))
+  } catch {
+    return new Set()
+  }
+}
+
+function saveDirtyTopicIds(server: string, ids: Set<string>): void {
+  try {
+    if (ids.size === 0) {
+      localStorage.removeItem(dirtyTopicsKey(server))
+      return
+    }
+    localStorage.setItem(dirtyTopicsKey(server), JSON.stringify([...ids]))
+  } catch {
+    // ignore
+  }
+}
+
+function markTopicDirty(server: string, topicId: string): void {
+  const ids = loadDirtyTopicIds(server)
+  ids.add(topicId)
+  saveDirtyTopicIds(server, ids)
+}
+
+function markTopicClean(server: string, topicId: string): void {
+  const ids = loadDirtyTopicIds(server)
+  if (ids.delete(topicId)) {
+    saveDirtyTopicIds(server, ids)
+  }
+}
+
+// ── 连通性检查 ──────────────────────────────────────────────────────
 
 function readConnectivityCache(server: string, token: string): ConnectivityProbeResult | null {
   const now = Date.now()
@@ -438,6 +491,8 @@ async function getConfig(): Promise<{ server: string; token: string; source: Con
   return { server: cachedServer, token: cachedToken, source: cachedSource }
 }
 
+// ── 数据结构 ────────────────────────────────────────────────────────
+
 interface TopicFullData {
   topicId: string
   name: string
@@ -467,83 +522,7 @@ interface SyncActionResult {
   error?: string
 }
 
-// ── 状态 ──────────────────────────────────────────────────────────────
-
-const SNAPSHOT_KEY_PREFIX = 'cherry-sync-snapshot:' // localStorage key prefix for persisted snapshot
-const FORCED_WRITEBACK_KEY = 'cherry-sync-forced-writeback' // localStorage key for persisted forced write-back queue
-const STORE_CHANGE_DEBOUNCE_MS = 5_000 // debounce for Redux store changes (shorter than sync interval)
-
-function snapshotStorageKey(server: string): string {
-  return `${SNAPSHOT_KEY_PREFIX}${server || 'default'}`
-}
-
-/** 从 localStorage 恢复上次的快照（App 重启后不丢失） */
-function loadPersistedSnapshot(server: string): Map<string, string> {
-  try {
-    const raw = localStorage.getItem(snapshotStorageKey(server))
-    if (!raw) return new Map()
-    const entries: [string, string][] = JSON.parse(raw)
-    return new Map(entries)
-  } catch {
-    return new Map()
-  }
-}
-
-/** 将快照持久化到 localStorage */
-function savePersistedSnapshot(server: string, snapshot: Map<string, string>) {
-  try {
-    localStorage.setItem(snapshotStorageKey(server), JSON.stringify([...snapshot.entries()]))
-  } catch {
-    // localStorage 满了之类的极端情况，忽略
-  }
-}
-
-let previousSnapshot: Map<string, string> | null = null // null = 尚未初始化
-let previousSnapshotServer: string | null = null
-let isSyncRunning = false
-let isPullRunning = false
-const forcedUpsertTopicIds = new Set<string>()
-const forcedDeleteTopicIds = new Set<string>()
 const TERMINAL_STATUSES = new Set<SyncActionStatus>(['applied', 'noop', 'stale', 'not_found'])
-
-/** 从 localStorage 恢复 forced 回写队列（防止 cursor 推进后 app 崩溃丢失队列） */
-function loadPersistedForcedWriteBack(): void {
-  try {
-    const raw = localStorage.getItem(FORCED_WRITEBACK_KEY)
-    if (!raw) return
-    const parsed = JSON.parse(raw)
-    if (!parsed || typeof parsed !== 'object') return
-    const upserts = Array.isArray(parsed.upserts) ? parsed.upserts : []
-    const deletes = Array.isArray(parsed.deletes) ? parsed.deletes : []
-    for (const id of upserts) {
-      if (typeof id === 'string' && id) forcedUpsertTopicIds.add(id)
-    }
-    for (const id of deletes) {
-      if (typeof id === 'string' && id) forcedDeleteTopicIds.add(id)
-    }
-  } catch {
-    // ignore
-  }
-}
-
-/** 将 forced 回写队列持久化到 localStorage */
-function savePersistedForcedWriteBack(): void {
-  try {
-    if (forcedUpsertTopicIds.size === 0 && forcedDeleteTopicIds.size === 0) {
-      localStorage.removeItem(FORCED_WRITEBACK_KEY)
-      return
-    }
-    localStorage.setItem(
-      FORCED_WRITEBACK_KEY,
-      JSON.stringify({
-        upserts: [...forcedUpsertTopicIds],
-        deletes: [...forcedDeleteTopicIds]
-      })
-    )
-  } catch {
-    // localStorage 满了之类的极端情况，忽略
-  }
-}
 
 // ── 工具函数 ──────────────────────────────────────────────────────────
 
@@ -615,19 +594,19 @@ async function getTopicFullData(topicId: string): Promise<TopicFullData | null> 
     const messages = topic.messages || []
     if (messages.length === 0) {
       const meta = getTopicMeta(topicId)
-    return {
-      topicId,
-      name: meta?.name || '未命名',
-      assistantId: meta?.assistantId || null,
-      assistantName: meta?.assistantName || '',
-      createdAt: meta?.createdAt || null,
-      updatedAt: meta?.updatedAt || null,
-      pinned: meta?.pinned,
-      prompt: meta?.prompt,
-      type: meta?.type,
-      isNameManuallyEdited: meta?.isNameManuallyEdited,
-      messages: []
-    }
+      return {
+        topicId,
+        name: meta?.name || '未命名',
+        assistantId: meta?.assistantId || null,
+        assistantName: meta?.assistantName || '',
+        createdAt: meta?.createdAt || null,
+        updatedAt: meta?.updatedAt || null,
+        pinned: meta?.pinned,
+        prompt: meta?.prompt,
+        type: meta?.type,
+        isNameManuallyEdited: meta?.isNameManuallyEdited,
+        messages: []
+      }
     }
 
     // 批量获取所有相关的 message blocks
@@ -648,8 +627,6 @@ async function getTopicFullData(topicId: string): Promise<TopicFullData | null> 
       prompt: meta?.prompt,
       type: meta?.type,
       isNameManuallyEdited: meta?.isNameManuallyEdited,
-      // Keep all message-level metadata (askId/modelId/multiModelMessageStyle/etc.)
-      // so sync pull will not break multi-model grouping or layout switching.
       messages: messages.map((msg) => {
         const messageRecord = msg as Record<string, unknown>
         const { blocks: _ignoredBlocks, ...messageMeta } = messageRecord
@@ -711,6 +688,12 @@ function toSyncActionResult(
   }
 }
 
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+// ── API 函数 ─────────────────────────────────────────────────────────
+
 async function apiPostTopic(topic: TopicFullData, options?: { force?: boolean }): Promise<SyncActionResult> {
   const { server, token } = await getConfig()
   if (!server) return { ok: false, topicId: topic.topicId, status: 'error', error: 'missing_server' }
@@ -770,8 +753,6 @@ async function apiPostBatch(
     return out
   }
 
-  // Single topic fallback uses the non-batch endpoint to reduce payload wrapper overhead
-  // and avoid repeated 413 responses from /batch for borderline payload sizes.
   if (topics.length === 1) {
     const topic = topics[0]
     const result = await apiPostTopic(topic, options)
@@ -860,7 +841,51 @@ async function apiPostBatch(
   return out
 }
 
-async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActionResult>> {
+async function apiDeleteTopic(
+  topicId: string,
+  options?: { force?: boolean; expectedRevision?: number }
+): Promise<SyncActionResult> {
+  const { server, token } = await getConfig()
+  if (!server) return { ok: false, topicId, status: 'error', error: 'missing_server' }
+
+  try {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${token}`
+    }
+    if (options?.force) {
+      headers['X-Sync-Force'] = '1'
+    }
+    if (typeof options?.expectedRevision === 'number' && Number.isFinite(options.expectedRevision) && options.expectedRevision > 0) {
+      headers['X-Sync-If-Revision'] = String(Math.floor(options.expectedRevision))
+    }
+
+    const resp = await fetchWithTimeout(`${server}/api/topics/${encodeURIComponent(topicId)}`, {
+      method: 'DELETE',
+      headers
+    })
+
+    const text = await resp.text()
+    let decoded: unknown = null
+    try {
+      decoded = text ? JSON.parse(text) : null
+    } catch (_) {}
+
+    if (!resp.ok) {
+      logger.error(`DELETE /api/topics/${topicId} failed: ${resp.status} ${shortenResponseText(text)}`)
+      return { ok: false, topicId, status: 'error', error: `http_${resp.status}` }
+    }
+
+    return toSyncActionResult(topicId, decoded)
+  } catch (e) {
+    logger.error(`DELETE /api/topics/${topicId} network error`, e instanceof Error ? e : new Error(String(e)))
+    return { ok: false, topicId, status: 'error', error: 'network_error' }
+  }
+}
+
+async function apiDeleteBatch(
+  topicIds: string[],
+  options?: { force?: boolean; expectedRevisions?: Map<string, number> }
+): Promise<Map<string, SyncActionResult>> {
   const { server, token } = await getConfig()
   const out = new Map<string, SyncActionResult>()
   if (!server) {
@@ -870,12 +895,25 @@ async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActio
     return out
   }
 
+  if (options?.expectedRevisions) {
+    for (const topicId of topicIds) {
+      const expectedRevision = options.expectedRevisions.get(topicId)
+      const result = await apiDeleteTopic(topicId, {
+        force: options.force,
+        expectedRevision
+      })
+      out.set(topicId, result)
+    }
+    return out
+  }
+
   try {
     const resp = await fetchWithTimeout(`${server}/api/topics/delete-batch`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
+        Authorization: `Bearer ${token}`,
+        ...(options?.force ? { 'X-Sync-Force': '1' } : {})
       },
       body: JSON.stringify({ topicIds })
     })
@@ -918,8 +956,8 @@ async function apiDeleteBatch(topicIds: string[]): Promise<Map<string, SyncActio
   return out
 }
 
-async function fetchServerTopicIds(server: string, token: string): Promise<string[]> {
-  const resp = await fetchWithTimeout(`${server}/api/topics`, {
+async function fetchManifest(server: string, token: string): Promise<ManifestResponse> {
+  const resp = await fetchWithTimeout(`${server}/api/sync/manifest`, {
     method: 'GET',
     headers: {
       Authorization: `Bearer ${token}`
@@ -927,38 +965,127 @@ async function fetchServerTopicIds(server: string, token: string): Promise<strin
   })
 
   const text = await resp.text()
+  if (!resp.ok) {
+    throw new Error(`manifest_http_${resp.status}`)
+  }
+
   let decoded: unknown = null
   try {
     decoded = text ? JSON.parse(text) : null
   } catch {
-    decoded = null
+    throw new Error('manifest_parse_error')
   }
 
-  if (!resp.ok) {
-    logger.error(`GET /api/topics failed: ${resp.status} ${shortenResponseText(text)}`)
-    throw new Error(`list_http_${resp.status}`)
+  if (!isRecord(decoded)) {
+    throw new Error('manifest_invalid_format')
   }
 
-  const root = isRecord(decoded) ? decoded : {}
-  const rawTopics = Array.isArray(root.topics) ? root.topics : []
-  const topicIds = new Set<string>()
-
-  for (const topic of rawTopics) {
-    if (!isRecord(topic)) continue
-    const topicId =
-      (typeof topic.topicId === 'string' && topic.topicId) ||
-      (typeof topic.topic_id === 'string' && topic.topic_id) ||
-      (typeof topic.id === 'string' && topic.id) ||
-      ''
-    if (topicId) topicIds.add(topicId)
+  const entries: Record<string, ManifestEntry> = {}
+  const rawEntries = isRecord(decoded.entries) ? decoded.entries : {}
+  for (const [topicId, entry] of Object.entries(rawEntries)) {
+    if (!isRecord(entry)) continue
+    entries[topicId] = {
+      revision: Number(entry.revision || 0),
+      deletedAt: entry.deletedAt == null ? null : Number(entry.deletedAt)
+    }
   }
 
-  return [...topicIds]
+  return {
+    changeSeq: Number(decoded.changeSeq || 0),
+    topicCount: Number(decoded.topicCount || 0),
+    entries
+  }
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
+async function fetchTopicById(server: string, token: string, topicId: string): Promise<TopicFullData | null> {
+  try {
+    const resp = await fetchWithTimeout(`${server}/api/topics/${topicId}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    })
+
+    if (resp.status === 404) return null
+    const text = await resp.text()
+    if (!resp.ok) {
+      logger.error(`GET /api/topics/${topicId} failed: ${resp.status}`)
+      return null
+    }
+
+    const decoded = text ? JSON.parse(text) : null
+    if (!isRecord(decoded)) return null
+
+    return (decoded.topic || decoded.data || decoded) as TopicFullData
+  } catch (e) {
+    logger.error(`Failed to fetch topic ${topicId}`, e instanceof Error ? e : new Error(String(e)))
+    return null
+  }
 }
+
+async function fetchTopicsBatch(
+  server: string,
+  token: string,
+  topicIds: string[]
+): Promise<Map<string, TopicFullData>> {
+  const out = new Map<string, TopicFullData>()
+  if (topicIds.length === 0) return out
+
+  if (topicIds.length <= BATCH_GET_THRESHOLD) {
+    for (const id of topicIds) {
+      const data = await fetchTopicById(server, token, id)
+      if (data) out.set(id, data)
+    }
+    return out
+  }
+
+  try {
+    const resp = await fetchWithTimeout(`${server}/api/topics/batch-get`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ topicIds })
+    })
+
+    const text = await resp.text()
+    if (!resp.ok) {
+      logger.error(`POST /api/topics/batch-get failed: ${resp.status}`)
+      // fallback to individual fetches
+      for (const id of topicIds) {
+        const data = await fetchTopicById(server, token, id)
+        if (data) out.set(id, data)
+      }
+      return out
+    }
+
+    const decoded = text ? JSON.parse(text) : null
+    if (!isRecord(decoded) || !Array.isArray(decoded.topics)) {
+      return out
+    }
+
+    for (const item of decoded.topics) {
+      if (!isRecord(item)) continue
+      const topicId = item.topicId as string
+      const topicData = (item.topic || item) as TopicFullData
+      if (topicId && topicData) {
+        out.set(topicId, topicData)
+      }
+    }
+  } catch (e) {
+    logger.error('POST /api/topics/batch-get error', e instanceof Error ? e : new Error(String(e)))
+    // fallback to individual fetches
+    for (const id of topicIds) {
+      const data = await fetchTopicById(server, token, id)
+      if (data) out.set(id, data)
+    }
+  }
+
+  return out
+}
+
+// ── 数据归一化与 DB 写入 ────────────────────────────────────────────
 
 function toMessageBlockStatus(value: unknown): MessageBlockStatus {
   if (
@@ -1006,100 +1133,6 @@ function toIsoString(value: unknown): string {
   const parsed = parseTimeMs(value)
   if (parsed > 0) return new Date(parsed).toISOString()
   return new Date().toISOString()
-}
-
-function parseServerChangeItem(raw: unknown): ServerChangeItem | null {
-  if (!isRecord(raw)) return null
-
-  const seq = Number(raw.seq || 0)
-  const topicId = typeof raw.topicId === 'string' ? raw.topicId : ''
-  const opRaw = raw.op
-  const op = opRaw === 'delete' ? 'delete' : opRaw === 'upsert' ? 'upsert' : null
-  if (!topicId || !op || !Number.isFinite(seq) || seq <= 0) return null
-
-  return {
-    seq,
-    topicId,
-    op,
-    revision: Number(raw.revision || 0),
-    updatedAt: Number(raw.updatedAt || 0),
-    clientUpdatedAt: Number(raw.clientUpdatedAt || 0),
-    topic: isRecord(raw.topic) ? (raw.topic as TopicFullData) : undefined
-  }
-}
-
-async function fetchServerChanges(
-  server: string,
-  token: string,
-  cursor: number
-): Promise<{ items: ServerChangeItem[]; nextCursor: number; hasMore: boolean; oldestAvailableSeq: number }> {
-  const resp = await fetchWithTimeout(
-    `${server}/api/sync/changes?cursor=${cursor}&limit=${PULL_PAGE_LIMIT}&includePayload=1`,
-    {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`
-      }
-    }
-  )
-
-  const text = await resp.text()
-  let payload: unknown = null
-  try {
-    payload = text ? JSON.parse(text) : null
-  } catch {
-    payload = null
-  }
-
-  if (!resp.ok) {
-    throw new Error(`pull_http_${resp.status}`)
-  }
-
-  const root = isRecord(payload) ? payload : {}
-  const rawItems = Array.isArray(root.items) ? root.items : []
-  const items = rawItems.map(parseServerChangeItem).filter(Boolean) as ServerChangeItem[]
-  const nextCursor = Number(root.nextCursor ?? cursor)
-  const hasMore = root.hasMore === true
-  const oldestAvailableSeq = Number(root.oldestAvailableSeq ?? 0)
-
-  return {
-    items,
-    nextCursor: Number.isFinite(nextCursor) ? nextCursor : cursor,
-    hasMore,
-    oldestAvailableSeq: Number.isFinite(oldestAvailableSeq) ? oldestAvailableSeq : 0
-  }
-}
-
-async function fetchAllServerChanges(
-  server: string,
-  token: string,
-  cursor: number
-): Promise<{ items: ServerChangeItem[]; nextCursor: number; oldestAvailableSeq: number }> {
-  const items: ServerChangeItem[] = []
-  let currentCursor = cursor
-  let pages = 0
-  let oldestAvailableSeq = 0
-
-  while (pages < 50 && items.length < MAX_PULL_ITEMS) {
-    const page = await fetchServerChanges(server, token, currentCursor)
-    pages += 1
-    items.push(...page.items)
-    currentCursor = page.nextCursor
-
-    // 只取首页返回的 oldestAvailableSeq（后续分页值相同）
-    if (pages === 1) {
-      oldestAvailableSeq = page.oldestAvailableSeq
-    }
-
-    if (!page.hasMore) break
-    if (page.items.length === 0) break
-  }
-
-  return {
-    items: items.slice(0, MAX_PULL_ITEMS),
-    nextCursor: currentCursor,
-    oldestAvailableSeq
-  }
 }
 
 function cloneAssistantsForUpdate(): any[] {
@@ -1233,7 +1266,8 @@ function normalizeIncomingTopic(
         ...(blockRecord as unknown as MessageBlock),
         id: blockId,
         messageId,
-        createdAt: typeof blockRecord.createdAt === 'string' ? blockRecord.createdAt : toIsoString(blockRecord.createdAt),
+        createdAt:
+          typeof blockRecord.createdAt === 'string' ? blockRecord.createdAt : toIsoString(blockRecord.createdAt),
         status: toMessageBlockStatus(blockRecord.status)
       }
 
@@ -1249,7 +1283,8 @@ function normalizeIncomingTopic(
       role,
       assistantId,
       topicId: incoming.topicId,
-      createdAt: typeof messageRecord.createdAt === 'string' ? messageRecord.createdAt : toIsoString(messageRecord.createdAt),
+      createdAt:
+        typeof messageRecord.createdAt === 'string' ? messageRecord.createdAt : toIsoString(messageRecord.createdAt),
       updatedAt:
         typeof messageRecord.updatedAt === 'string'
           ? messageRecord.updatedAt
@@ -1329,342 +1364,56 @@ async function applyDeleteToDb(topicId: string): Promise<void> {
   })
 }
 
-function buildPullPlan(items: ServerChangeItem[]): PullPlanItem[] {
-  const snapshot = getTopicSnapshotFromStore()
-  const plan: PullPlanItem[] = []
+// ── 迁移函数 ────────────────────────────────────────────────────────
 
-  for (const item of items) {
-    const localMarker = snapshot.get(item.topicId)
-    const baselineMarker = previousSnapshot?.get(item.topicId)
+const OLD_SNAPSHOT_KEY_PREFIX = 'cherry-sync-snapshot:'
+const OLD_FORCED_WRITEBACK_KEY = 'cherry-sync-forced-writeback'
 
-    // Local topic was deleted after last baseline but not pushed yet.
-    // Treat remote upsert as conflict to avoid resurrecting locally deleted topics.
-    if (localMarker === undefined && baselineMarker !== undefined && item.op === 'upsert') {
-      plan.push({
-        item,
-        conflict: true,
-        localUpdatedAt: parseTimeMs(baselineMarker),
-        remoteUpdatedAt: Number(item.updatedAt || 0),
-        remoteClientUpdatedAt: Number(item.clientUpdatedAt || 0),
-        reason: 'local_deleted_pending'
-      })
-      continue
-    }
+function migrateFromSnapshotIfNeeded(server: string): void {
+  const revisionsKey = syncedRevisionsKey(server)
+  // 如果已有 syncedRevisions，说明已迁移过
+  if (localStorage.getItem(revisionsKey)) return
 
-    if (localMarker === undefined) {
-      plan.push({
-        item,
-        conflict: false,
-        localUpdatedAt: 0,
-        remoteUpdatedAt: Number(item.updatedAt || 0),
-        remoteClientUpdatedAt: Number(item.clientUpdatedAt || 0)
-      })
-      continue
-    }
+  const oldSnapshotKey = `${OLD_SNAPSHOT_KEY_PREFIX}${server || 'default'}`
+  const oldSnapshot = localStorage.getItem(oldSnapshotKey)
 
-    const localTs = parseTimeMs(localMarker)
-    const remoteClientTs = Number(item.clientUpdatedAt || 0)
-    const remoteUpdatedTs = Number(item.updatedAt || 0)
-    const remoteTs = Number(item.clientUpdatedAt || item.updatedAt || 0)
+  // 首次运行新代码：将所有 topic 标记为 dirty，syncedRevision 设为 0
+  const localSnapshot = getTopicSnapshotFromStore()
+  const dirtyIds = new Set<string>()
+  const revisions = new Map<string, number>()
 
-    // 自己推送的数据被拉回来：本地时间戳与服务端记录的 clientUpdatedAt 完全一致
-    // 跳过以避免无意义地覆写 IndexedDB（特别是用户可能正在编辑该 topic）
-    if (remoteClientTs > 0 && localTs === remoteClientTs && item.op === 'upsert') {
-      plan.push({
-        item,
-        conflict: false,
-        skip: true,
-        localUpdatedAt: localTs,
-        remoteUpdatedAt: remoteUpdatedTs,
-        remoteClientUpdatedAt: remoteClientTs
-      })
-      continue
-    }
-
-    const conflict = remoteTs <= 0 ? true : localTs > remoteTs + 1000
-    const reason: PullConflictItem['reason'] | undefined =
-      remoteTs <= 0 ? 'remote_timestamp_missing' : conflict ? 'local_newer' : undefined
-
-    plan.push({
-      item,
-      conflict,
-      localUpdatedAt: localTs,
-      remoteUpdatedAt: remoteUpdatedTs,
-      remoteClientUpdatedAt: remoteClientTs,
-      reason
-    })
+  for (const topicId of localSnapshot.keys()) {
+    revisions.set(topicId, 0) // 首次 manifest 同步会自动修正
+    dirtyIds.add(topicId) // 所有 topic 标记为 dirty
   }
 
-  return plan
+  saveSyncedRevisions(server, revisions)
+  saveDirtyTopicIds(server, dirtyIds)
+
+  // 清理旧数据
+  if (oldSnapshot) {
+    localStorage.removeItem(oldSnapshotKey)
+  }
+  const oldForced = localStorage.getItem(OLD_FORCED_WRITEBACK_KEY)
+  if (oldForced) {
+    localStorage.removeItem(OLD_FORCED_WRITEBACK_KEY)
+  }
+
+  logger.info(
+    `Migrated from snapshot to manifest-based sync: ${localSnapshot.size} topics marked dirty, revisions initialized to 0`
+  )
 }
 
-function toConflictItem(entry: PullPlanItem): PullConflictItem {
-  return {
-    seq: entry.item.seq,
-    topicId: entry.item.topicId,
-    op: entry.item.op,
-    localUpdatedAt: entry.localUpdatedAt,
-    remoteUpdatedAt: entry.remoteUpdatedAt,
-    remoteClientUpdatedAt: entry.remoteClientUpdatedAt,
-    reason: entry.reason || 'local_newer'
-  }
-}
+// ── 同步状态 ────────────────────────────────────────────────────────
 
-function queueWriteBackFromLocalWins(topicIds: Iterable<string>): number {
-  const snapshot = getTopicSnapshotFromStore()
-  let queued = 0
-
-  for (const topicId of topicIds) {
-    if (!topicId) continue
-    if (snapshot.has(topicId)) {
-      forcedUpsertTopicIds.add(topicId)
-      forcedDeleteTopicIds.delete(topicId)
-    } else {
-      forcedDeleteTopicIds.add(topicId)
-      forcedUpsertTopicIds.delete(topicId)
-    }
-    queued += 1
-  }
-
-  // 立即持久化，防止 cursor 已推进但 app 崩溃时丢失队列
-  savePersistedForcedWriteBack()
-  return queued
-}
-
-function applyPullToSnapshot(
-  server: string,
-  applied: Array<{ topicId: string; op: 'upsert' | 'delete'; marker?: string }>
-) {
-  if (!previousSnapshot || previousSnapshotServer !== server) return
-
-  for (const item of applied) {
-    if (item.op === 'delete') {
-      previousSnapshot.delete(item.topicId)
-      continue
-    }
-
-    if (item.marker) {
-      previousSnapshot.set(item.topicId, item.marker)
-    }
-  }
-
-  savePersistedSnapshot(server, previousSnapshot)
-}
-
-async function pullFromServer({
-  applySafe,
-  skipConnectivityCheck = false,
-  conflictStrategy = 'stop'
-}: {
-  applySafe: boolean
-  skipConnectivityCheck?: boolean
-  conflictStrategy?: PullConflictStrategy
-}): Promise<PullExecutionResult | null> {
-  if (isPullRunning) {
-    logger.verbose('Pull skipped: another pull task is still running.')
-    return null
-  }
-
-  isPullRunning = true
-  try {
-    const { server, token, source } = await getConfig()
-    if (!server) {
-      updateRuntimeConfig({ server, token, source })
-      return null
-    }
-
-    if (applySafe && (previousSnapshot === null || previousSnapshotServer !== server)) {
-      previousSnapshot = loadPersistedSnapshot(server)
-      previousSnapshotServer = server
-    }
-
-    if (!skipConnectivityCheck) {
-      const connectivity = await refreshConnectivity(true)
-      if (!connectivity.ok) return null
-    }
-
-    const cursor = getPullCursor(server)
-    updateRuntimeConfig({ server, token, source })
-
-    let fetched = await fetchAllServerChanges(server, token, cursor)
-
-    // 检测 cursor 是否落入已 purge 的空洞：
-    // 如果 cursor > 0 且小于服务端最小可用 seq，说明部分变更已被清理，
-    // 需要重置 cursor 从头拉取以避免静默丢失数据
-    if (cursor > 0 && fetched.oldestAvailableSeq > 0 && cursor < fetched.oldestAvailableSeq) {
-      logger.warn(
-        `Pull cursor ${cursor} is stale (oldest available seq=${fetched.oldestAvailableSeq}). ` +
-          'Resetting cursor to 0 for full re-sync.'
-      )
-      setPullCursor(server, 0)
-      fetched = await fetchAllServerChanges(server, token, 0)
-    }
-
-    const plan = buildPullPlan(fetched.items)
-    const skipped = plan.filter((entry) => entry.skip).length
-    const safe = plan.filter((entry) => !entry.conflict && !entry.skip).length
-    const conflicts = plan.filter((entry) => entry.conflict).length
-    const firstConflictSeq = plan.find((entry) => entry.conflict)?.item.seq ?? null
-    const allConflictItems = plan.filter((entry) => entry.conflict).map(toConflictItem)
-
-    let appliedCount = 0
-    let resolvedLocal = 0
-    let resolvedServer = 0
-    let writeBackQueued = 0
-    let blockedSeq: number | null = applySafe ? null : firstConflictSeq
-    let lastAppliedSeq = cursor
-    const appliedForSnapshot: Array<{ topicId: string; op: 'upsert' | 'delete'; marker?: string }> = []
-    const assistants = cloneAssistantsForUpdate()
-    let assistantsChanged = false
-    const localWinsCandidates = new Set<string>()
-
-    if (applySafe) {
-      for (const entry of plan) {
-        // 跳过自己推送后被拉回的未变更条目（noop）
-        if (entry.skip) {
-          // skip 条目只在冲突 seq 之前推进 cursor，避免跳过冲突
-          if (!blockedSeq) {
-            lastAppliedSeq = entry.item.seq
-          }
-          continue
-        }
-
-        if (entry.conflict) {
-          if (conflictStrategy === 'stop') {
-            // 记录冲突——cursor 不再向前推进，下次 pull 会重新拉取冲突及之后的条目
-            if (!blockedSeq) blockedSeq = entry.item.seq
-            continue
-          }
-
-          if (conflictStrategy === 'local_wins') {
-            localWinsCandidates.add(entry.item.topicId)
-            resolvedLocal += 1
-            lastAppliedSeq = entry.item.seq
-            continue
-          }
-        }
-
-        // stop 策略下，冲突之后的安全条目仍然处理，但不推进 cursor
-        // 这样下次 pull 会从冲突 seq 重新开始，已处理的安全条目会被 skip（noop）
-        const canAdvanceCursor = !blockedSeq
-
-        if (entry.item.op === 'delete') {
-          await applyDeleteToDb(entry.item.topicId)
-          if (removeTopicMetaFromAssistants(assistants, entry.item.topicId)) {
-            assistantsChanged = true
-          }
-          appliedForSnapshot.push({ topicId: entry.item.topicId, op: 'delete' })
-          appliedCount += 1
-          if (entry.conflict) {
-            resolvedServer += 1
-          }
-          if (canAdvanceCursor) lastAppliedSeq = entry.item.seq
-          continue
-        }
-
-        if (!entry.item.topic) {
-          if (!blockedSeq) blockedSeq = entry.item.seq
-          continue
-        }
-
-        const resolvedAssistant = resolveAssistantId(assistants, entry.item.topic)
-        if (resolvedAssistant.createdAssistant) {
-          assistantsChanged = true
-        }
-        const targetAssistantId = resolvedAssistant.assistantId
-        const normalized = normalizeIncomingTopic(entry.item.topic, targetAssistantId)
-        await applyUpsertToDb(entry.item.topic.topicId, normalized.messages, normalized.blocks)
-
-        if (upsertTopicMetaInAssistants(assistants, targetAssistantId, normalized.topicMeta)) {
-          assistantsChanged = true
-        }
-
-        appliedForSnapshot.push({
-          topicId: entry.item.topic.topicId,
-          op: 'upsert',
-          marker: normalized.topicMeta.updatedAt || normalized.topicMeta.createdAt
-        })
-        appliedCount += 1
-        if (entry.conflict) {
-          resolvedServer += 1
-        }
-        if (canAdvanceCursor) lastAppliedSeq = entry.item.seq
-      }
-
-      if (assistantsChanged) {
-        try {
-          store.dispatch(updateAssistants(assistants))
-        } catch (dispatchErr) {
-          // Redux dispatch 失败——DB 已写入但 assistant 状态未更新
-          // 回退 cursor 使下次 pull 重新处理，DB 写入是幂等的
-          logger.error(
-            'Failed to dispatch updateAssistants, cursor will not advance',
-            dispatchErr instanceof Error ? dispatchErr : new Error(String(dispatchErr))
-          )
-          lastAppliedSeq = cursor
-          blockedSeq = blockedSeq ?? lastAppliedSeq
-        }
-      }
-
-      if (localWinsCandidates.size > 0) {
-        writeBackQueued = queueWriteBackFromLocalWins(localWinsCandidates)
-      }
-    }
-
-    // 有冲突时 cursor 推进到最后一个已处理的 safe seq（跳过冲突），无冲突时推到服务端返回的末尾
-    const nextCursor = applySafe ? (blockedSeq ? Math.max(lastAppliedSeq, cursor) : fetched.nextCursor) : cursor
-    if (applySafe) {
-      setPullCursor(server, nextCursor)
-      applyPullToSnapshot(server, appliedForSnapshot)
-    }
-
-    const pendingConflicts = applySafe
-      ? blockedSeq
-        ? allConflictItems.filter((item) => item.seq >= blockedSeq)
-        : []
-      : allConflictItems
-
-    const summary: PullSummary = {
-      total: plan.length,
-      safe,
-      skipped,
-      conflicts,
-      applied: appliedCount,
-      conflictResolvedLocal: resolvedLocal,
-      conflictResolvedServer: resolvedServer,
-      writeBackQueued,
-      nextCursor,
-      blockedSeq
-    }
-
-    updateSyncRuntimeState({
-      pullCursor: nextCursor,
-      lastPullAt: Date.now(),
-      lastPullSummary: summary,
-      pendingConflicts: pendingConflicts.slice(0, 100),
-      lastError: applySafe && blockedSeq ? `Pull blocked by conflict at seq ${blockedSeq}` : null
-    })
-
-    return {
-      summary,
-      pendingConflicts
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    updateSyncRuntimeState({
-      lastError: `Pull failed: ${message}`
-    })
-    logger.error('Pull failed', error instanceof Error ? error : new Error(message))
-    return null
-  } finally {
-    isPullRunning = false
-  }
-}
-
+let isSyncRunning = false
 let syncTimeout: ReturnType<typeof setTimeout> | null = null
 let syncIntervalTimer: ReturnType<typeof setInterval> | null = null
 let lastAssistantsState: unknown = null
+let lastAssistantsSnapshot: Map<string, string> | null = null
 let hasStarted = false
+
+const STORE_CHANGE_DEBOUNCE_MS = 5_000
 
 function restartSyncIntervalTimer() {
   if (syncIntervalTimer) {
@@ -1732,12 +1481,14 @@ function buildFailureMessage(failures: SyncFailureItem[], failedCount: number): 
   return `Sync failed: ${failedCount} actions, top reason=${topReason[0]} (${topReason[1]})`
 }
 
-// ── 同步主循环 ────────────────────────────────────────────────────────
+// ── 同步主循环（manifest 协调） ──────────────────────────────────────
 
 async function syncOnce(): Promise<void> {
-  const { server } = await getConfig()
+  const { server, token } = await getConfig()
   if (isSyncRunning) return
+  if (!server) return
   isSyncRunning = true
+
   const syncMode = getSyncMode()
   const conflictPolicy = getConflictPolicy()
   updateSyncRuntimeState({
@@ -1745,124 +1496,150 @@ async function syncOnce(): Promise<void> {
     lastError: null,
     syncMode,
     conflictPolicy,
-    pullCursor: server ? getPullCursor(server) : 0,
+    pullCursor: getPullCursor(server),
     syncProgress: {
-      phase: 'pull',
+      phase: 'manifest',
       total: 0,
       processed: 0,
       failed: 0
     }
   })
 
+  // 1. 连通性检查
   const connectivity = await refreshConnectivity()
   if (!connectivity.ok) {
     isSyncRunning = false
     updateSyncRuntimeState({
       running: false,
-      syncProgress: {
-        phase: 'idle',
-        total: 0,
-        processed: 0,
-        failed: 0
-      }
+      syncProgress: { phase: 'idle', total: 0, processed: 0, failed: 0 }
     })
     logger.verbose(`Sync skipped: connectivity=${connectivity.status}, error=${connectivity.error || 'none'}`)
     return
   }
 
   try {
-    let didInitSnapshot = false
-    if (previousSnapshot === null || previousSnapshotServer !== server) {
-      previousSnapshot = loadPersistedSnapshot(server)
-      previousSnapshotServer = server
-      didInitSnapshot = true
-    }
+    // 迁移检查
+    migrateFromSnapshotIfNeeded(server)
 
-    if (syncMode === 'auto_safe' || syncMode === 'auto_full') {
-      const pullResult = await pullFromServer({
-        applySafe: true,
-        skipConnectivityCheck: true,
-        conflictStrategy: syncMode === 'auto_safe' ? 'stop' : conflictPolicy
-      })
-      if (pullResult) {
-        const pullSummary = pullResult.summary
-        updateSyncRuntimeState({
-          syncProgress: {
-            phase: 'pull',
-            total: pullSummary.total,
-            processed: pullSummary.applied,
-            failed: pullSummary.conflicts
+    // 2. 拉取 manifest
+    const manifest = await fetchManifest(server, token)
+
+    // 3. 加载本地状态
+    const syncedRevisions = loadSyncedRevisions(server)
+    const dirtyTopicIds = loadDirtyTopicIds(server)
+    const localSnapshot = getTopicSnapshotFromStore()
+    const localTopicIds = new Set(localSnapshot.keys())
+
+    // 4. 协调 (reconcile)
+    const toFetchSet = new Set<string>()
+    const toFetchUpdateSet = new Set<string>() // 区分拉取新增 vs 拉取更新
+    const toDeleteLocalSet = new Set<string>()
+    const toPushSet = new Set<string>()
+    const toDeleteRemoteSet = new Set<string>()
+    let conflictCount = 0
+    const conflictItems: SyncFailureItem[] = []
+
+    for (const [topicId, entry] of Object.entries(manifest.entries)) {
+      const localHas = localTopicIds.has(topicId)
+      const syncedRev = syncedRevisions.get(topicId) ?? -1
+      const isDirty = dirtyTopicIds.has(topicId)
+      const serverDeleted = entry.deletedAt != null
+
+      if (serverDeleted) {
+        // 服务端已删除
+        if (localHas && !isDirty) {
+          toDeleteLocalSet.add(topicId)
+        } else if (localHas && isDirty) {
+          // 本地有修改但服务端已删，按冲突策略处理
+          if (syncMode === 'push_only') {
+            // push_only 不拉取，保留本地
+          } else if (syncMode === 'auto_full') {
+            if (conflictPolicy === 'server_wins') {
+              toDeleteLocalSet.add(topicId)
+            } else {
+              toPushSet.add(topicId) // local_wins: 复活到服务端
+            }
+          } else {
+            // auto_safe: 记录冲突，不操作
+            conflictCount++
+            conflictItems.push({ topicId, op: 'upsert', status: 'conflict', error: 'server_deleted_local_dirty' })
           }
-        })
+        }
+        continue
+      }
 
-        if (pullSummary.conflicts > 0 && pullSummary.blockedSeq) {
-          logger.warn(
-            `Auto pull paused at seq=${pullSummary.blockedSeq ?? 'unknown'}; ` +
-              `safe=${pullSummary.safe}, conflicts=${pullSummary.conflicts}, applied=${pullSummary.applied}`
-          )
-        } else if (pullSummary.conflictResolvedLocal > 0 || pullSummary.conflictResolvedServer > 0) {
-          logger.info(
-            `Auto full pull resolved conflicts: local=${pullSummary.conflictResolvedLocal}, ` +
-              `server=${pullSummary.conflictResolvedServer}, writeBackQueued=${pullSummary.writeBackQueued}`
-          )
-        } else if (pullSummary.applied > 0) {
-          logger.info(
-            `Auto pull applied ${pullSummary.applied} changes; ` +
-              `safe=${pullSummary.safe}, conflicts=${pullSummary.conflicts}`
-          )
-        } else if (pullSummary.total > 0) {
-          logger.verbose(
-            `Auto pull found ${pullSummary.total} changes; ` +
-              `safe=${pullSummary.safe}, conflicts=${pullSummary.conflicts}`
-          )
+      if (!localHas) {
+        // 服务端有、本地没有
+        if (isDirty) {
+          // 本地曾删除此 topic 但标记了 dirty（本地删除待推送）
+          toDeleteRemoteSet.add(topicId)
+        } else if (syncMode !== 'push_only') {
+          toFetchSet.add(topicId)
+          // 本地不存在 → 新增
+        }
+        continue
+      }
+
+      if (entry.revision > syncedRev) {
+        // 服务端有新版本
+        if (!isDirty) {
+          if (syncMode !== 'push_only') {
+            toFetchSet.add(topicId)
+            toFetchUpdateSet.add(topicId) // 本地已有但版本落后 → 更新
+          }
+        } else {
+          // 冲突：服务端和本地都有修改
+          if (syncMode === 'auto_full') {
+            if (conflictPolicy === 'server_wins') {
+              toFetchSet.add(topicId)
+              toFetchUpdateSet.add(topicId)
+            } else {
+              toPushSet.add(topicId) // local_wins: 强制推送
+            }
+          } else if (syncMode === 'auto_safe') {
+            conflictCount++
+            conflictItems.push({ topicId, op: 'upsert', status: 'conflict', error: 'both_modified' })
+          }
+          // push_only: 只推送，跳过拉取
         }
       }
     }
 
-    const currentSnapshot = getTopicSnapshotFromStore()
-
-    // 首次运行：从 localStorage 恢复快照（可能为空）
-    if (didInitSnapshot && previousSnapshot) {
-      logger.info(
-        `Initialized: ${currentSnapshot.size} local topics, ` + `${previousSnapshot.size} in last synced snapshot`
-      )
-      // 不 return —— 继续往下 diff，这样：
-      // - 全新安装（空快照）→ 所有 Topic 视为"新增" → 全量推送
-      // - 重启（有快照）→ 只推送变更的 Topic
-    }
-
-    // 计算 diff
-    const added: string[] = []
-    const updated: string[] = []
-    const deleted: string[] = []
-
-    for (const [id, updatedAt] of currentSnapshot) {
-      if (!previousSnapshot.has(id)) {
-        added.push(id)
-      } else if (previousSnapshot.get(id) !== updatedAt) {
-        updated.push(id)
+    // dirty topic → toPush
+    for (const topicId of dirtyTopicIds) {
+      if (localTopicIds.has(topicId)) {
+        // 检查是否已在 toFetch 中被 server_wins 覆盖
+        if (!toFetchSet.has(topicId)) {
+          toPushSet.add(topicId)
+        }
+      } else {
+        // 本地没有此 topic（已删除）→ 推送删除
+        toDeleteRemoteSet.add(topicId)
       }
     }
 
-    for (const id of previousSnapshot.keys()) {
-      if (!currentSnapshot.has(id)) {
-        deleted.push(id)
+    // 本地有、服务端没有且 dirty → toPush (新 topic)
+    for (const topicId of localTopicIds) {
+      if (!manifest.entries[topicId] && dirtyTopicIds.has(topicId)) {
+        toPushSet.add(topicId)
       }
     }
 
-    const forcedUpserts = [...forcedUpsertTopicIds]
-
-    if (
-      added.length === 0 &&
-      updated.length === 0 &&
-      deleted.length === 0 &&
-      forcedUpserts.length === 0 &&
-      forcedDeleteTopicIds.size === 0
-    ) {
-      return // 无变更
+    if (conflictCount > 0) {
+      logger.warn(`Manifest reconcile: ${conflictCount} conflicts detected (auto_safe mode, skipping)`)
     }
 
-    const nextSnapshot = new Map(previousSnapshot)
+    logger.verbose(
+      `Manifest reconcile: toFetch=${toFetchSet.size}, toPush=${toPushSet.size}, ` +
+        `toDeleteLocal=${toDeleteLocalSet.size}, toDeleteRemote=${toDeleteRemoteSet.size}, conflicts=${conflictCount}`
+    )
+
+    // 转为数组供后续遍历
+    const toFetch = [...toFetchSet]
+    const toDeleteLocal = [...toDeleteLocalSet]
+    const toPush = [...toPushSet]
+    const toDeleteRemote = [...toDeleteRemoteSet]
+
     let appliedCount = 0
     let noopCount = 0
     let staleCount = 0
@@ -1875,188 +1652,214 @@ async function syncOnce(): Promise<void> {
       error: string | null | undefined
     ) => {
       if (failedActions.length >= 100) return
-      failedActions.push({
-        topicId,
-        op,
-        status,
-        error: error || null
-      })
+      failedActions.push({ topicId, op, status, error: error || null })
     }
 
-    // 处理新增 + 更新 + 冲突回写（本地优先）
-    const toUpload = [...new Set([...added, ...updated, ...forcedUpserts])]
-    let uploadProcessed = 0
-    let uploadFailed = 0
-    const emitUploadProgress = (force = false) => {
-      const total = toUpload.length
-      if (!force && uploadProcessed % 5 !== 0 && uploadProcessed !== total) return
+    // 5. Pull: 从服务端拉取
+    if (toFetch.length > 0) {
       updateSyncRuntimeState({
-        syncProgress: {
-          phase: 'push_upsert',
-          total,
-          processed: uploadProcessed,
-          failed: uploadFailed
-        }
+        syncProgress: { phase: 'pull', total: toFetch.length, processed: 0, failed: 0 }
       })
+
+      const fetched = await fetchTopicsBatch(server, token, toFetch)
+      const assistants = cloneAssistantsForUpdate()
+      let assistantsChanged = false
+      let pullProcessed = 0
+
+      for (const topicId of toFetch) {
+        const topicData = fetched.get(topicId)
+        if (!topicData) {
+          pullProcessed++
+          continue
+        }
+
+        const resolvedAssistant = resolveAssistantId(assistants, topicData)
+        if (resolvedAssistant.createdAssistant) assistantsChanged = true
+
+        const normalized = normalizeIncomingTopic(topicData, resolvedAssistant.assistantId)
+        await applyUpsertToDb(topicId, normalized.messages, normalized.blocks)
+
+        if (upsertTopicMetaInAssistants(assistants, resolvedAssistant.assistantId, normalized.topicMeta)) {
+          assistantsChanged = true
+        }
+
+        // 更新 syncedRevision
+        const serverEntry = manifest.entries[topicId]
+        if (serverEntry) {
+          syncedRevisions.set(topicId, serverEntry.revision)
+        }
+
+        // 如果该 topic 非 dirty，则不需要再标记为 clean（它本来就不 dirty）
+        // 如果是冲突且 server_wins，从 dirty 中移除
+        dirtyTopicIds.delete(topicId)
+
+        appliedCount++
+        pullProcessed++
+        if (pullProcessed % 10 === 0 || pullProcessed === toFetch.length) {
+          updateSyncRuntimeState({
+            syncProgress: { phase: 'pull', total: toFetch.length, processed: pullProcessed, failed: 0 }
+          })
+        }
+      }
+
+      if (assistantsChanged) {
+        try {
+          store.dispatch(updateAssistants(assistants))
+        } catch (dispatchErr) {
+          logger.error(
+            'Failed to dispatch updateAssistants after pull',
+            dispatchErr instanceof Error ? dispatchErr : new Error(String(dispatchErr))
+          )
+        }
+      }
     }
 
-    updateSyncRuntimeState({
-      syncProgress: {
-        phase: 'push_upsert',
-        total: toUpload.length,
-        processed: 0,
-        failed: 0
-      }
-    })
+    // 6. Push: 推送本地变更
+    if (toPush.length > 0) {
+      updateSyncRuntimeState({
+        syncProgress: { phase: 'push_upsert', total: toPush.length, processed: 0, failed: 0 }
+      })
 
-    if (toUpload.length > 0) {
-      const applyUploadTopics = async (topics: TopicFullData[], forceWrite: boolean) => {
-        if (topics.length === 0) return
+      let pushProcessed = 0
+      let pushFailed = 0
+      const forceWrite = syncMode === 'auto_full' && conflictPolicy === 'local_wins'
 
-        if (topics.length === 1) {
-          const one = topics[0]
-          const result = await apiPostTopic(one, { force: forceWrite })
-          if (TERMINAL_STATUSES.has(result.status)) {
-            const marker = currentSnapshot.get(one.topicId)
-            if (marker !== undefined) nextSnapshot.set(one.topicId, marker)
-            if (forcedUpsertTopicIds.has(one.topicId)) {
-              forcedUpsertTopicIds.delete(one.topicId)
-            }
-          }
-          if (result.status === 'applied') appliedCount++
-          else if (result.status === 'noop' || result.status === 'not_found') noopCount++
-          else if (result.status === 'stale') staleCount++
-          else {
-            failedCount++
-            uploadFailed++
-            recordFailure(one.topicId, 'upsert', result.status, result.error)
-          }
-          uploadProcessed++
-          emitUploadProgress()
-          return
-        }
-
-        const results = await apiPostBatch(topics, { force: forceWrite })
-        for (const topic of topics) {
-          const result = results.get(topic.topicId)
-          if (result && TERMINAL_STATUSES.has(result.status)) {
-            const marker = currentSnapshot.get(topic.topicId)
-            if (marker !== undefined) nextSnapshot.set(topic.topicId, marker)
-            if (forcedUpsertTopicIds.has(topic.topicId)) {
-              forcedUpsertTopicIds.delete(topic.topicId)
-            }
-          }
-
-          const status: SyncActionStatus = result?.status ?? 'error'
-          if (status === 'applied') appliedCount++
-          else if (status === 'noop' || status === 'not_found') noopCount++
-          else if (status === 'stale') staleCount++
-          else {
-            failedCount++
-            uploadFailed++
-            recordFailure(topic.topicId, 'upsert', status, result?.error)
-          }
-          uploadProcessed++
-          emitUploadProgress()
-        }
-      }
-
-      // 分批上传
-      for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
-        const batch = toUpload.slice(i, i + BATCH_SIZE)
+      for (let i = 0; i < toPush.length; i += BATCH_SIZE) {
+        const batch = toPush.slice(i, i + BATCH_SIZE)
         const topicsData: TopicFullData[] = []
 
         for (const id of batch) {
           const data = await getTopicFullData(id)
           if (!data) {
-            if (forcedUpsertTopicIds.has(id)) {
-              forcedUpsertTopicIds.delete(id)
-              forcedDeleteTopicIds.add(id)
-            }
-            uploadProcessed++
-            emitUploadProgress()
+            // 本地数据不存在，从 dirty 集合移除防止无限重试
+            logger.warn(`Topic ${id} not found in IndexedDB, removing from dirty set`)
+            dirtyTopicIds.delete(id)
+            pushProcessed++
             continue
           }
-
-          // 冲突后本地优先回写时，强制使用当前时间避免被服务端 stale 拒绝
-          if (forcedUpsertTopicIds.has(id)) {
-            data.updatedAt = new Date().toISOString()
-          }
-
           topicsData.push(data)
         }
 
-        const forcedTopics = topicsData.filter((topic) => forcedUpsertTopicIds.has(topic.topicId))
-        const normalTopics = topicsData.filter((topic) => !forcedUpsertTopicIds.has(topic.topicId))
+        if (topicsData.length === 0) continue
 
-        await applyUploadTopics(normalTopics, false)
-        await applyUploadTopics(forcedTopics, true)
-      }
-      emitUploadProgress(true)
-    }
+        const results = await apiPostBatch(topicsData, { force: forceWrite })
+        for (const topic of topicsData) {
+          const result = results.get(topic.topicId)
+          const status: SyncActionStatus = result?.status ?? 'error'
 
-    // 处理删除
-    const toDeleteSet = new Set([...deleted, ...forcedDeleteTopicIds])
-    for (const id of toUpload) {
-      toDeleteSet.delete(id)
-      forcedDeleteTopicIds.delete(id)
-    }
-    const toDelete = [...toDeleteSet]
-    let deleteProcessed = 0
-    let deleteFailed = 0
-    const emitDeleteProgress = (force = false) => {
-      const total = toDelete.length
-      if (!force && deleteProcessed % 5 !== 0 && deleteProcessed !== total) return
-      updateSyncRuntimeState({
-        syncProgress: {
-          phase: 'push_delete',
-          total,
-          processed: deleteProcessed,
-          failed: deleteFailed
-        }
-      })
-    }
-
-    updateSyncRuntimeState({
-      syncProgress: {
-        phase: 'push_delete',
-        total: toDelete.length,
-        processed: 0,
-        failed: 0
-      }
-    })
-
-    for (let i = 0; i < toDelete.length; i += BATCH_SIZE) {
-      const batch = toDelete.slice(i, i + BATCH_SIZE)
-      const results = await apiDeleteBatch(batch)
-      for (const id of batch) {
-        const result = results.get(id)
-        if (result && TERMINAL_STATUSES.has(result.status)) {
-          nextSnapshot.delete(id)
-          if (forcedDeleteTopicIds.has(id)) {
-            forcedDeleteTopicIds.delete(id)
+          if (TERMINAL_STATUSES.has(status)) {
+            // 更新 syncedRevision
+            if (result?.revision != null) {
+              syncedRevisions.set(topic.topicId, result.revision)
+            }
+            dirtyTopicIds.delete(topic.topicId)
           }
+
+          if (status === 'applied') appliedCount++
+          else if (status === 'noop' || status === 'not_found') noopCount++
+          else if (status === 'stale') staleCount++
+          else {
+            failedCount++
+            pushFailed++
+            recordFailure(topic.topicId, 'upsert', status, result?.error)
+          }
+          pushProcessed++
         }
 
-        const status: SyncActionStatus = result?.status ?? 'error'
-        if (status === 'applied') appliedCount++
-        else if (status === 'noop' || status === 'not_found') noopCount++
-        else if (status === 'stale') staleCount++
-        else {
-          failedCount++
-          deleteFailed++
-          recordFailure(id, 'delete', status, result?.error)
+        if (pushProcessed % 5 === 0 || pushProcessed === toPush.length) {
+          updateSyncRuntimeState({
+            syncProgress: { phase: 'push_upsert', total: toPush.length, processed: pushProcessed, failed: pushFailed }
+          })
         }
-        deleteProcessed++
-        emitDeleteProgress()
       }
     }
-    emitDeleteProgress(true)
+
+    // 7. 本地删除
+    if (toDeleteLocal.length > 0) {
+      const assistants = cloneAssistantsForUpdate()
+      let assistantsChanged = false
+
+      for (const topicId of toDeleteLocal) {
+        await applyDeleteToDb(topicId)
+        if (removeTopicMetaFromAssistants(assistants, topicId)) {
+          assistantsChanged = true
+        }
+        syncedRevisions.delete(topicId)
+        dirtyTopicIds.delete(topicId)
+        appliedCount++
+      }
+
+      if (assistantsChanged) {
+        try {
+          store.dispatch(updateAssistants(assistants))
+        } catch (dispatchErr) {
+          logger.error(
+            'Failed to dispatch updateAssistants after local delete',
+            dispatchErr instanceof Error ? dispatchErr : new Error(String(dispatchErr))
+          )
+        }
+      }
+    }
+
+    // 8. 远程删除
+    if (toDeleteRemote.length > 0) {
+      updateSyncRuntimeState({
+        syncProgress: { phase: 'push_delete', total: toDeleteRemote.length, processed: 0, failed: 0 }
+      })
+
+      let deleteProcessed = 0
+      let deleteFailed = 0
+
+      for (let i = 0; i < toDeleteRemote.length; i += BATCH_SIZE) {
+        const batch = toDeleteRemote.slice(i, i + BATCH_SIZE)
+        const results = await apiDeleteBatch(batch, { expectedRevisions: syncedRevisions })
+
+        for (const id of batch) {
+          const result = results.get(id)
+          const status: SyncActionStatus = result?.status ?? 'error'
+
+          if (TERMINAL_STATUSES.has(status)) {
+            syncedRevisions.delete(id)
+            dirtyTopicIds.delete(id)
+          }
+
+          if (status === 'applied') appliedCount++
+          else if (status === 'noop' || status === 'not_found') noopCount++
+          else if (status === 'stale') staleCount++
+          else {
+            failedCount++
+            deleteFailed++
+            recordFailure(id, 'delete', status, result?.error)
+          }
+          deleteProcessed++
+        }
+
+        updateSyncRuntimeState({
+          syncProgress: {
+            phase: 'push_delete',
+            total: toDeleteRemote.length,
+            processed: deleteProcessed,
+            failed: deleteFailed
+          }
+        })
+      }
+    }
+
+    // 9. 持久化更新
+    saveSyncedRevisions(server, syncedRevisions)
+    saveDirtyTopicIds(server, dirtyTopicIds)
+
+    // 10. 设置 cursor = manifest.changeSeq（可选优化）
+    setPullCursor(server, manifest.changeSeq)
+
+    const fetchNewCount = toFetch.length - toFetchUpdateSet.size
+    const fetchUpdateCount = toFetchUpdateSet.size
+    const allFailures = [...failedActions, ...conflictItems]
 
     logSyncResult({
-      added: added.length,
-      updated: updated.length,
-      deleted: toDelete.length,
+      added: fetchNewCount,
+      updated: fetchUpdateCount,
+      deleted: toDeleteLocal.length + toDeleteRemote.length,
       applied: appliedCount,
       noop: noopCount,
       stale: staleCount,
@@ -2065,56 +1868,45 @@ async function syncOnce(): Promise<void> {
 
     updateSyncRuntimeState({
       lastSyncAt: Date.now(),
+      lastPullAt: toFetch.length > 0 ? Date.now() : getSyncRuntimeState().lastPullAt,
+      pullCursor: manifest.changeSeq,
       lastResult: {
-        added: added.length,
-        updated: updated.length,
-        deleted: toDelete.length,
+        added: fetchNewCount,
+        updated: fetchUpdateCount,
+        deleted: toDeleteLocal.length + toDeleteRemote.length,
         applied: appliedCount,
         noop: noopCount,
         stale: staleCount,
+        conflict: conflictCount,
         failed: failedCount
       },
-      lastFailures: failedCount > 0 ? failedActions : [],
-      lastError: failedCount > 0 ? buildFailureMessage(failedActions, failedCount) : null,
-      syncProgress: {
-        phase: 'idle',
-        total: 0,
-        processed: 0,
-        failed: 0
-      }
+      lastFailures: allFailures.length > 0 ? allFailures : [],
+      lastError:
+        failedCount > 0
+          ? buildFailureMessage(failedActions, failedCount)
+          : conflictCount > 0
+            ? `${conflictCount} conflict(s) detected in auto_safe mode, manual resolution needed`
+            : null,
+      syncProgress: { phase: 'idle', total: 0, processed: 0, failed: 0 }
     })
-
-    // 更新快照（内存 + 持久化）
-    previousSnapshot = nextSnapshot
-    savePersistedSnapshot(server, nextSnapshot)
-    // 推送完成后持久化 forced 队列（已成功的条目已从 Set 中删除）
-    savePersistedForcedWriteBack()
   } catch (e) {
     const error = e instanceof Error ? e : new Error(String(e))
     logger.error('Sync loop error', error)
     updateSyncRuntimeState({
       lastFailures: [],
       lastError: error.message,
-      syncProgress: {
-        phase: 'idle',
-        total: 0,
-        processed: 0,
-        failed: 0
-      }
+      syncProgress: { phase: 'idle', total: 0, processed: 0, failed: 0 }
     })
   } finally {
     isSyncRunning = false
     updateSyncRuntimeState({
       running: false,
-      syncProgress: {
-        phase: 'idle',
-        total: 0,
-        processed: 0,
-        failed: 0
-      }
+      syncProgress: { phase: 'idle', total: 0, processed: 0, failed: 0 }
     })
   }
 }
+
+// ── 强制推送 ────────────────────────────────────────────────────────
 
 async function triggerFullPushToServer(options?: { pruneRemote?: boolean }): Promise<void> {
   if (isSyncRunning) {
@@ -2129,54 +1921,165 @@ async function triggerFullPushToServer(options?: { pruneRemote?: boolean }): Pro
     return
   }
 
-  const currentSnapshot = getTopicSnapshotFromStore()
+  isSyncRunning = true
   const pruneRemote = options?.pruneRemote === true
 
-  previousSnapshot = new Map()
-  previousSnapshotServer = server
-  savePersistedSnapshot(server, previousSnapshot)
+  try {
+    updateSyncRuntimeState({
+      running: true,
+      lastError: null,
+      lastResult: null,
+      lastFailures: [],
+      syncProgress: { phase: 'manifest', total: 0, processed: 0, failed: 0 }
+    })
 
-  forcedUpsertTopicIds.clear()
-  forcedDeleteTopicIds.clear()
-  for (const topicId of currentSnapshot.keys()) {
-    forcedUpsertTopicIds.add(topicId)
-  }
-  savePersistedForcedWriteBack()
+    // 1. 拉取 manifest
+    const manifest = await fetchManifest(server, token)
+    const localSnapshot = getTopicSnapshotFromStore()
 
-  if (pruneRemote) {
-    try {
-      const remoteTopicIds = await fetchServerTopicIds(server, token)
-      const localTopicIds = new Set(currentSnapshot.keys())
-      for (const topicId of remoteTopicIds) {
-        if (!localTopicIds.has(topicId)) {
-          forcedDeleteTopicIds.add(topicId)
+    // 2. toPush = 全部本地 topic
+    const toPush = [...localSnapshot.keys()]
+
+    // 3. toDeleteRemote = manifest 中有但本地没有的
+    const toDeleteRemote: string[] = []
+    if (pruneRemote) {
+      for (const topicId of Object.keys(manifest.entries)) {
+        if (!localSnapshot.has(topicId) && manifest.entries[topicId].deletedAt == null) {
+          toDeleteRemote.push(topicId)
         }
       }
-    } catch (e) {
-      const error = e instanceof Error ? e : new Error(String(e))
-      logger.error('Full push + prune skipped: failed to fetch remote topic list', error)
-      updateSyncRuntimeState({
-        lastError: error.message
-      })
-      return
     }
+
+    let appliedCount = 0
+    let noopCount = 0
+    let staleCount = 0
+    let failedCount = 0
+    const failedActions: SyncFailureItem[] = []
+    const recordFailure = (
+      topicId: string,
+      op: 'upsert' | 'delete',
+      status: SyncActionStatus,
+      error: string | null | undefined
+    ) => {
+      if (failedActions.length >= 100) return
+      failedActions.push({ topicId, op, status, error: error || null })
+    }
+
+    // 4. 批量推送
+    updateSyncRuntimeState({
+      syncProgress: { phase: 'push_upsert', total: toPush.length, processed: 0, failed: 0 }
+    })
+
+    const newSyncedRevisions = new Map<string, number>()
+    let pushProcessed = 0
+
+    for (let i = 0; i < toPush.length; i += BATCH_SIZE) {
+      const batch = toPush.slice(i, i + BATCH_SIZE)
+      const topicsData: TopicFullData[] = []
+
+      for (const id of batch) {
+        const data = await getTopicFullData(id)
+        if (!data) {
+          logger.warn(`Full push: topic ${id} not found in IndexedDB, skipping`)
+          pushProcessed++
+          continue
+        }
+        topicsData.push(data)
+      }
+
+      if (topicsData.length > 0) {
+        const results = await apiPostBatch(topicsData, { force: true })
+        for (const topic of topicsData) {
+          const result = results.get(topic.topicId)
+          const status: SyncActionStatus = result?.status ?? 'error'
+
+          if (result?.revision != null) {
+            newSyncedRevisions.set(topic.topicId, result.revision)
+          }
+
+          if (status === 'applied') appliedCount++
+          else if (status === 'noop' || status === 'not_found') noopCount++
+          else if (status === 'stale') staleCount++
+          else {
+            failedCount++
+            recordFailure(topic.topicId, 'upsert', status, result?.error)
+          }
+          pushProcessed++
+        }
+      }
+
+      updateSyncRuntimeState({
+        syncProgress: { phase: 'push_upsert', total: toPush.length, processed: pushProcessed, failed: failedCount }
+      })
+    }
+
+    // 5. 批量删除远程
+    if (toDeleteRemote.length > 0) {
+      updateSyncRuntimeState({
+        syncProgress: { phase: 'push_delete', total: toDeleteRemote.length, processed: 0, failed: 0 }
+      })
+
+      for (let i = 0; i < toDeleteRemote.length; i += BATCH_SIZE) {
+        const batch = toDeleteRemote.slice(i, i + BATCH_SIZE)
+        const results = await apiDeleteBatch(batch)
+
+        for (const id of batch) {
+          const result = results.get(id)
+          const status: SyncActionStatus = result?.status ?? 'error'
+          if (status === 'applied') appliedCount++
+          else if (status === 'noop' || status === 'not_found') noopCount++
+          else {
+            failedCount++
+            recordFailure(id, 'delete', status, result?.error)
+          }
+        }
+      }
+    }
+
+    // 6. 用返回值更新 syncedRevisions，清空 dirty
+    saveSyncedRevisions(server, newSyncedRevisions)
+    saveDirtyTopicIds(server, new Set())
+
+    // cursor 更新到 manifest.changeSeq（推送后服务端 changeSeq 已更新，但 manifest 是推送前拉的）
+    // 这里不精确没关系，下次 syncOnce 会重新拉 manifest
+    setPullCursor(server, manifest.changeSeq)
+
+    logger.info(
+      `Full push completed: ${toPush.length} uploads, ${toDeleteRemote.length} remote deletes, ` +
+        `applied=${appliedCount}, noop=${noopCount}, stale=${staleCount}, failed=${failedCount}`
+    )
+
+    updateSyncRuntimeState({
+      lastSyncAt: Date.now(),
+      pullCursor: manifest.changeSeq,
+      lastResult: {
+        added: 0,
+        updated: toPush.length,
+        deleted: toDeleteRemote.length,
+        applied: appliedCount,
+        noop: noopCount,
+        stale: staleCount,
+        conflict: 0,
+        failed: failedCount
+      },
+      lastFailures: failedCount > 0 ? failedActions : [],
+      lastError: failedCount > 0 ? buildFailureMessage(failedActions, failedCount) : null,
+      syncProgress: { phase: 'idle', total: 0, processed: 0, failed: 0 }
+    })
+  } catch (e) {
+    const error = e instanceof Error ? e : new Error(String(e))
+    logger.error('Full push error', error)
+    updateSyncRuntimeState({
+      lastError: error.message,
+      syncProgress: { phase: 'idle', total: 0, processed: 0, failed: 0 }
+    })
+  } finally {
+    isSyncRunning = false
+    updateSyncRuntimeState({
+      running: false,
+      syncProgress: { phase: 'idle', total: 0, processed: 0, failed: 0 }
+    })
   }
-
-  updateSyncRuntimeState({
-    configured: true,
-    server,
-    tokenConfigured: Boolean(token),
-    configSource: source,
-    pullCursor: getPullCursor(server),
-    lastResult: null,
-    lastFailures: [],
-    lastError: null
-  })
-
-  logger.info(
-    `Full push queued (${currentSnapshot.size} uploads, ${forcedDeleteTopicIds.size} remote deletes, prune=${pruneRemote ? 'on' : 'off'}).`
-  )
-  await syncOnce()
 }
 
 // ── 启动 ──────────────────────────────────────────────────────────────
@@ -2185,23 +2088,20 @@ async function start() {
   if (hasStarted) return
   hasStarted = true
 
-  // 恢复上次未完成的 forced 回写队列
-  loadPersistedForcedWriteBack()
-
   const { server } = await getConfig()
   const intervalMs = getSyncIntervalMs()
   if (server) {
-    logger.info(`Starting sync to ${server} (interval=${intervalMs}ms)`)
+    logger.info(`Starting manifest-based sync to ${server} (interval=${intervalMs}ms)`)
   } else {
     logger.info('No sync server configured. Waiting for config from settings.')
   }
 
   restartSyncIntervalTimer()
 
-  // 立即执行一次（建立基线）
+  // 立即执行一次
   syncOnce()
 
-  // 提供手动触发入口，供设置页调用
+  // 手动触发入口
   window.addEventListener('cherry-sync-force', () => {
     syncOnce()
   })
@@ -2214,12 +2114,12 @@ async function start() {
     triggerFullPushToServer({ pruneRemote: true })
   })
 
-  // 提供连通性检查入口，供设置页调用
+  // 连通性检查入口
   window.addEventListener('cherry-sync-check', () => {
     refreshConnectivity(true)
   })
 
-  // 设置同步模式（push_only / manual_pull / auto_safe / auto_full）
+  // 设置同步模式
   window.addEventListener('cherry-sync-set-mode', (event) => {
     const detail = (event as CustomEvent<{ mode?: SyncMode }>).detail
     if (!isSyncMode(detail?.mode)) return
@@ -2232,7 +2132,7 @@ async function start() {
     }
   })
 
-  // 设置冲突策略（local_wins / server_wins）
+  // 设置冲突策略
   window.addEventListener('cherry-sync-set-conflict-policy', (event) => {
     const detail = (event as CustomEvent<{ policy?: ConflictPolicy }>).detail
     if (!isConflictPolicy(detail?.policy)) return
@@ -2258,15 +2158,13 @@ async function start() {
     const runtime = getSyncRuntimeState()
     if (!runtime.lastFailures.length) return
 
+    const { server } = await getConfig()
+    if (!server) return
+
+    // 将失败的 topic 标记为 dirty
     for (const failure of runtime.lastFailures) {
       if (!failure.topicId) continue
-      if (failure.op === 'delete') {
-        forcedDeleteTopicIds.add(failure.topicId)
-        forcedUpsertTopicIds.delete(failure.topicId)
-      } else {
-        forcedUpsertTopicIds.add(failure.topicId)
-        forcedDeleteTopicIds.delete(failure.topicId)
-      }
+      markTopicDirty(server, failure.topicId)
     }
 
     updateSyncRuntimeState({
@@ -2284,79 +2182,91 @@ async function start() {
     logger.info('Sync errors dismissed by user action')
   })
 
-  window.addEventListener('cherry-sync-rebuild-baseline', async () => {
-    if (isSyncRunning) {
-      logger.verbose('Rebuild baseline skipped: sync loop is running.')
-      return
-    }
-
-    const { server, token, source } = await getConfig()
-    if (!server) {
-      updateRuntimeConfig({ server, token, source })
-      return
-    }
-
-    const snapshot = getTopicSnapshotFromStore()
-    previousSnapshot = new Map(snapshot)
-    previousSnapshotServer = server
-    savePersistedSnapshot(server, previousSnapshot)
-    forcedUpsertTopicIds.clear()
-    forcedDeleteTopicIds.clear()
-    savePersistedForcedWriteBack()
-
-    updateSyncRuntimeState({
-      configured: true,
-      server,
-      tokenConfigured: Boolean(token),
-      configSource: source,
-      pullCursor: getPullCursor(server),
-      lastResult: null,
-      lastFailures: [],
-      lastError: null
-    })
-    logger.info(`Sync baseline rebuilt from local snapshot (${snapshot.size} topics)`)
-  })
-
-  // 预览服务端增量（只分析，不写本地）
+  // 预览服务端增量（用 manifest 做 dry-run）
   window.addEventListener('cherry-sync-pull-preview', async () => {
     if (isSyncRunning) {
       logger.verbose('Pull preview skipped: sync loop is running.')
       return
     }
 
-    const result = await pullFromServer({ applySafe: false })
-    if (!result) return
-    const summary = result.summary
+    try {
+      const { server, token } = await getConfig()
+      if (!server) return
+      const manifest = await fetchManifest(server, token)
+      const syncedRevisions = loadSyncedRevisions(server)
+      const localSnapshot = getTopicSnapshotFromStore()
 
-    logger.info(
-      `Pull preview: total=${summary.total}, safe=${summary.safe}, ` +
-        `conflicts=${summary.conflicts}, cursor=${summary.nextCursor}`
-    )
+      let newFromServer = 0
+      let updatedOnServer = 0
+      let deletedOnServer = 0
+
+      for (const [topicId, entry] of Object.entries(manifest.entries)) {
+        if (entry.deletedAt != null) {
+          if (localSnapshot.has(topicId)) deletedOnServer++
+          continue
+        }
+        if (!localSnapshot.has(topicId)) {
+          newFromServer++
+        } else if (entry.revision > (syncedRevisions.get(topicId) ?? -1)) {
+          updatedOnServer++
+        }
+      }
+
+      logger.info(
+        `Pull preview: new=${newFromServer}, updated=${updatedOnServer}, deleted=${deletedOnServer}, ` +
+          `manifest.topicCount=${manifest.topicCount}`
+      )
+    } catch (e) {
+      logger.error('Pull preview failed', e instanceof Error ? e : new Error(String(e)))
+    }
   })
 
-  // 应用可安全拉取的增量，遇到冲突即停（保留 cursor 以便后续人工处理）
+  // 手动拉取
   window.addEventListener('cherry-sync-pull-apply', async () => {
     if (isSyncRunning) {
       logger.verbose('Pull apply skipped: sync loop is running.')
       return
     }
+    await syncOnce()
+  })
 
-    const result = await pullFromServer({ applySafe: true, conflictStrategy: 'stop' })
-    if (!result) return
-    const summary = result.summary
-
-    if (summary.conflicts > 0) {
-      logger.warn(
-        `Pull apply paused at seq=${summary.blockedSeq ?? 'unknown'}; ` +
-          `safe=${summary.safe}, conflicts=${summary.conflicts}, applied=${summary.applied}`
-      )
+  window.addEventListener('cherry-sync-rebuild-baseline', async () => {
+    if (isSyncRunning) {
+      logger.verbose('Rebuild baseline skipped: sync loop is running.')
       return
     }
 
-    if (summary.applied > 0) {
-      logger.info(`Pull apply completed: applied=${summary.applied}, cursor=${summary.nextCursor}`)
-    } else {
-      logger.verbose('Pull apply completed: no safe server changes to apply.')
+    try {
+      const { server, token } = await getConfig()
+      if (!server) return
+
+      const manifest = await fetchManifest(server, token)
+      const localSnapshot = getTopicSnapshotFromStore()
+      const nextRevisions = new Map<string, number>()
+
+      for (const topicId of localSnapshot.keys()) {
+        nextRevisions.set(topicId, manifest.entries[topicId]?.revision ?? 0)
+      }
+
+      saveSyncedRevisions(server, nextRevisions)
+      saveDirtyTopicIds(server, new Set())
+      setPullCursor(server, manifest.changeSeq)
+
+      updateSyncRuntimeState({
+        pullCursor: manifest.changeSeq,
+        lastFailures: [],
+        lastError: null
+      })
+
+      logger.info(
+        `Sync baseline rebuilt: localTopics=${localSnapshot.size}, manifestTopics=${manifest.topicCount}, cursor=${manifest.changeSeq}`
+      )
+    } catch (e) {
+      const error = e instanceof Error ? e : new Error(String(e))
+      logger.error('Rebuild baseline failed', error)
+      updateSyncRuntimeState({
+        lastError: error.message
+      })
     }
   })
 
@@ -2370,33 +2280,55 @@ async function start() {
     const detail = (event as CustomEvent<{ policy?: ConflictPolicy }>).detail
     const policy = isConflictPolicy(detail?.policy) ? detail.policy : getConflictPolicy()
 
-    const result = await pullFromServer({
-      applySafe: true,
-      conflictStrategy: policy
-    })
-    if (!result) return
+    // 强制执行一次同步，使用指定策略
+    const savedPolicy = getConflictPolicy()
+    localStorage.setItem(SYNC_CONFLICT_POLICY_KEY, policy)
+    const savedMode = getSyncMode()
+    localStorage.setItem(SYNC_MODE_KEY, 'auto_full')
 
-    const summary = result.summary
-    logger.info(
-      `Resolve conflicts (${policy}): local=${summary.conflictResolvedLocal}, ` +
-        `server=${summary.conflictResolvedServer}, writeBackQueued=${summary.writeBackQueued}, ` +
-        `blockedSeq=${summary.blockedSeq ?? 'none'}`
-    )
+    await syncOnce()
 
-    // local_wins 需要回写服务器，触发一次完整同步循环即可完成推送
-    if (summary.writeBackQueued > 0) {
-      await syncOnce()
-    }
+    // 恢复原策略
+    localStorage.setItem(SYNC_CONFLICT_POLICY_KEY, savedPolicy)
+    localStorage.setItem(SYNC_MODE_KEY, savedMode)
   })
 
-  // 监听 Redux Store 变化
+  // 监听 Redux Store 变化 → 自动标记 dirty
   store.subscribe(() => {
     const currentState = store.getState()
     const currentAssistantsState = currentState.assistants?.assistants
 
-    // 只有当 assistants 状态的内存引用发生变化时，才认为可能需要同步
     if (currentAssistantsState !== lastAssistantsState) {
       lastAssistantsState = currentAssistantsState
+
+      // 对比前后快照，找出 updatedAt 变化的 topic → 批量标记 dirty
+      const currentSnapshot = getTopicSnapshotFromStore()
+      if (lastAssistantsSnapshot && cachedServer) {
+        const newDirtyIds: string[] = []
+
+        for (const [topicId, updatedAt] of currentSnapshot) {
+          const prev = lastAssistantsSnapshot.get(topicId)
+          if (prev !== updatedAt) {
+            newDirtyIds.push(topicId)
+          }
+        }
+        // 找出被删除的 topic
+        for (const topicId of lastAssistantsSnapshot.keys()) {
+          if (!currentSnapshot.has(topicId)) {
+            newDirtyIds.push(topicId)
+          }
+        }
+
+        // 一次性加载、修改、保存 dirty 集合（避免 N 次序列化）
+        if (newDirtyIds.length > 0) {
+          const dirtyIds = loadDirtyTopicIds(cachedServer)
+          for (const id of newDirtyIds) {
+            dirtyIds.add(id)
+          }
+          saveDirtyTopicIds(cachedServer, dirtyIds)
+        }
+      }
+      lastAssistantsSnapshot = currentSnapshot
 
       // 防抖：重置倒计时
       if (syncTimeout) {
