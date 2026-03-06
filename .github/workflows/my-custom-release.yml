@@ -9,114 +9,164 @@ on:
   workflow_dispatch:
     inputs:
       force_tag:
-        description: "若需手动打包特定 Tag 请在此填写（例如 v1.0.0）。留空则自动检测是否有新版本。"
+        description: "手动指定要构建的 Tag（例如 v1.0.0），留空则自动选择 upstream latest release。"
         required: false
+        type: string
         default: ""
+      rebuild_existing:
+        description: "若目标 Release 已存在，是否强制重建并替换产物。"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: my-custom-auto-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: CherryHQ/cherry-studio
+  NODE_VERSION: "22"
+  ELECTRON_OFFICIAL_MIRROR: https://github.com/electron/electron/releases/download/
+
 jobs:
-  sync_and_prepare:
+  prepare:
+    # 避免 sync job 自己推送 main 后再次触发 push 形成循环
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     outputs:
-      should_build: ${{ steps.check.outputs.should_build }}
-      tag: ${{ steps.check.outputs.tag }}
-      build_ref: ${{ steps.check.outputs.build_ref }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      build_ref: ${{ steps.build_ref.outputs.build_ref }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Check and Sync
-        id: check
+      - name: Resolve target tag and build policy
+        id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_TAG: ${{ github.event.inputs.force_tag || '' }}
+          REBUILD_EXISTING: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.rebuild_existing || 'true' }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          INPUT_TAG="${{ github.event.inputs.force_tag }}"
           TARGET_TAG=""
-
-          if [ -n "$INPUT_TAG" ]; then
-            if [[ "$INPUT_TAG" != v* ]]; then
-              INPUT_TAG="v$INPUT_TAG"
+          if [ -n "$FORCE_TAG" ]; then
+            if [[ "$FORCE_TAG" != v* ]]; then
+              TARGET_TAG="v$FORCE_TAG"
+            else
+              TARGET_TAG="$FORCE_TAG"
             fi
-            TARGET_TAG="$INPUT_TAG"
-            echo "Manual tag requested: $TARGET_TAG"
+            echo "Manual tag requested: ${TARGET_TAG}"
           else
-            # 自动模式：只看 upstream 最新 release tag，不跟 upstream/main
-            git clone --bare https://github.com/CherryHQ/cherry-studio.git upstream_repo
-            TARGET_TAG=$(cd upstream_repo && git tag -l "v*" --sort=-v:refname | head -n 1)
-
+            TARGET_TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')"
             if [ -z "$TARGET_TAG" ]; then
-              echo "No tags found on upstream."
-              echo "should_build=false" >> $GITHUB_OUTPUT
-              exit 0
+              echo "::error::Failed to resolve latest upstream release tag."
+              exit 1
             fi
-
-            echo "Latest upstream release tag: $TARGET_TAG"
+            echo "Latest upstream release tag: ${TARGET_TAG}"
           fi
+
+          if ! git ls-remote --tags --exit-code "https://github.com/${UPSTREAM_REPO}.git" "refs/tags/${TARGET_TAG}" >/dev/null; then
+            echo "::error::Tag ${TARGET_TAG} does not exist in ${UPSTREAM_REPO}."
+            exit 1
+          fi
+
+          SHOULD_BUILD="true"
+          if gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            if [ "$REBUILD_EXISTING" = "true" ]; then
+              echo "Release ${TARGET_TAG} already exists in ${GITHUB_REPOSITORY}, will rebuild and replace artifacts."
+            else
+              echo "Release ${TARGET_TAG} already exists in ${GITHUB_REPOSITORY}, skipping."
+              SHOULD_BUILD="false"
+            fi
+          fi
+
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync upstream tag into main (preserve workflows)
+        if: steps.resolve.outputs.should_build == 'true'
+        env:
+          TARGET_TAG: ${{ steps.resolve.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/CherryHQ/cherry-studio.git || git remote set-url upstream https://github.com/CherryHQ/cherry-studio.git
-          git tag -d "$TARGET_TAG" >/dev/null 2>&1 || true
-          git fetch upstream +refs/tags/"$TARGET_TAG":refs/tags/"$TARGET_TAG"
-          git checkout main
 
-          # 将上游 release tag 合入 fork/main；保留本仓库 workflows
-          git merge "$TARGET_TAG" --no-commit --no-ff || true
-          if git ls-files -u | grep -q .; then
-            echo "::error::Merge conflicts detected when syncing $TARGET_TAG. Please resolve manually."
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+          git fetch origin main
+          git checkout main
+          git pull --ff-only origin main
+
+          git tag -d "${TARGET_TAG}" >/dev/null 2>&1 || true
+          git fetch upstream "+refs/tags/${TARGET_TAG}:refs/tags/${TARGET_TAG}"
+
+          MERGE_STARTED="false"
+          if git merge "refs/tags/${TARGET_TAG}" --no-commit --no-ff --allow-unrelated-histories; then
+            if [ -f .git/MERGE_HEAD ]; then
+              MERGE_STARTED="true"
+            fi
+          else
+            if git ls-files -u | grep -q .; then
+              echo "::error::Merge conflicts detected when syncing ${TARGET_TAG}. Please resolve manually."
+            else
+              echo "::error::Merge failed unexpectedly while syncing ${TARGET_TAG}."
+            fi
             git merge --abort || true
             exit 1
           fi
 
-          git restore --source=HEAD --staged --worktree .github/workflows/ || true
-
-          if git diff --cached --quiet; then
-            echo "No new changes after merging $TARGET_TAG."
+          if [ "$MERGE_STARTED" = "true" ]; then
+            git restore --source=HEAD --staged --worktree .github/workflows/ || true
+            git commit --allow-empty -m "chore: sync upstream ${TARGET_TAG} (preserve workflows)"
+            git push origin HEAD:main
           else
-            git commit -m "chore: sync stable release $TARGET_TAG from upstream excluding workflows modifications"
-            git push origin main
+            echo "main already contains ${TARGET_TAG}; no sync commit needed."
           fi
 
-          # 若本仓库已存在同名 release/tag，先删除，确保本次发布重新打包
-          if gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
-            echo "Deleting existing release: $TARGET_TAG"
-            gh release delete "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" --yes
-          fi
-          if git ls-remote --tags origin "refs/tags/$TARGET_TAG" | grep -q "$TARGET_TAG"; then
-            echo "Deleting existing remote tag: $TARGET_TAG"
-            git push origin ":refs/tags/$TARGET_TAG"
-          fi
+      - name: Capture build reference
+        id: build_ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "build_ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-          BUILD_SHA=$(git rev-parse HEAD)
-          echo "should_build=true" >> $GITHUB_OUTPUT
-          echo "tag=$TARGET_TAG" >> $GITHUB_OUTPUT
-          echo "build_ref=$BUILD_SHA" >> $GITHUB_OUTPUT
-
-  build_and_release:
-    needs: sync_and_prepare
-    if: needs.sync_and_prepare.outputs.should_build == 'true'
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
-      # 串行构建并保持顺序，优先构建 macOS
       max-parallel: 1
-      matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
       fail-fast: false
-
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
     steps:
-      - name: Check out fork repository code
+      - name: Check out build ref
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ needs.sync_and_prepare.outputs.build_ref }}
+          ref: ${{ needs.prepare.outputs.build_ref }}
 
       - name: Verify topic sync patch exists
         shell: bash
         run: |
+          set -euo pipefail
           test -f src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
           grep -q "key: 'topic_sync'" src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
           grep -q '"topic_sync"' src/renderer/src/i18n/locales/zh-cn.json
@@ -124,57 +174,68 @@ jobs:
       - name: Set package.json version
         shell: bash
         run: |
-          TAG="${{ needs.sync_and_prepare.outputs.tag }}"
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.tag }}"
           VERSION="${TAG#v}"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 22
-
-      - name: macos-latest dependencies fix
-        if: matrix.os == 'macos-latest'
-        run: |
-          brew install python-setuptools
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
 
-      - name: Get pnpm store directory
-        id: pnpm-cache
+      - name: Force official Electron mirror in CI
         shell: bash
-        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+        run: |
+          set -euo pipefail
+          {
+            echo "ELECTRON_MIRROR=${ELECTRON_OFFICIAL_MIRROR}"
+            echo "npm_config_electron_mirror=${ELECTRON_OFFICIAL_MIRROR}"
+          } >> "$GITHUB_ENV"
+          perl -0pi -e 's#mirror:\s*https://npmmirror\.com/mirrors/electron/#mirror: https://github.com/electron/electron/releases/download/#g' electron-builder.yml
 
-      - name: Cache pnpm dependencies
-        uses: actions/cache@v5
-        with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
 
-      - name: Install Dependencies
-        run: pnpm install
+      - name: macOS dependencies fix
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install python-setuptools || true
+          python3 -m pip install --user setuptools || true
 
       - name: Build Linux
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.platform == 'linux'
+        shell: bash
         run: |
+          set -euo pipefail
+          sudo apt-get update
           sudo apt-get install -y rpm
           pnpm build:linux --publish never
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_OPTIONS: --max-old-space-size=8192
           MAIN_VITE_CHERRYAI_CLIENT_SECRET: ${{ secrets.MAIN_VITE_CHERRYAI_CLIENT_SECRET }}
           MAIN_VITE_MINERU_API_KEY: ${{ secrets.MAIN_VITE_MINERU_API_KEY }}
           RENDERER_VITE_AIHUBMIX_SECRET: ${{ secrets.RENDERER_VITE_AIHUBMIX_SECRET }}
           RENDERER_VITE_PPIO_APP_SECRET: ${{ secrets.RENDERER_VITE_PPIO_APP_SECRET }}
 
-      - name: Build Mac
-        if: matrix.os == 'macos-latest'
+      - name: Build macOS
+        if: matrix.platform == 'mac'
+        shell: bash
         run: |
-          sudo -H pip install setuptools || true
+          set -euo pipefail
           pnpm build:mac --publish never
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -187,25 +248,129 @@ jobs:
           RENDERER_VITE_PPIO_APP_SECRET: ${{ secrets.RENDERER_VITE_PPIO_APP_SECRET }}
 
       - name: Build Windows
-        if: matrix.os == 'windows-latest'
-        run: pnpm build:win --publish never
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm build:win --publish never
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_OPTIONS: --max-old-space-size=8192
           MAIN_VITE_CHERRYAI_CLIENT_SECRET: ${{ secrets.MAIN_VITE_CHERRYAI_CLIENT_SECRET }}
           MAIN_VITE_MINERU_API_KEY: ${{ secrets.MAIN_VITE_MINERU_API_KEY }}
           RENDERER_VITE_AIHUBMIX_SECRET: ${{ secrets.RENDERER_VITE_AIHUBMIX_SECRET }}
           RENDERER_VITE_PPIO_APP_SECRET: ${{ secrets.RENDERER_VITE_PPIO_APP_SECRET }}
 
-      - name: Upload to Github Release
+      - name: Collect release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+
+          patterns=(
+            dist/*.exe
+            dist/*.zip
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.snap
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/latest*.yml
+            dist/rc*.yml
+            dist/beta*.yml
+            dist/*.blockmap
+          )
+
+          copied=0
+          for pattern in "${patterns[@]}"; do
+            for file in $pattern; do
+              cp "$file" "release-assets/$(basename "$file")"
+              copied=$((copied + 1))
+            done
+          done
+
+          if [ "$copied" -eq 0 ]; then
+            echo "::error::No release artifacts were found in dist/ for ${RUNNER_OS}."
+            exit 1
+          fi
+
+          echo "Collected ${copied} artifacts for ${RUNNER_OS}."
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.platform }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish_release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets-linux
+          path: release-assets/linux
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets-mac
+          path: release-assets/mac
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets-windows
+          path: release-assets/windows
+
+      - name: Build unique artifact list
+        id: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t files < <(find release-assets -type f | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No artifacts downloaded."
+            exit 1
+          fi
+
+          declare -A seen=()
+          unique_files=()
+
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            if [ -n "${seen[$name]:-}" ]; then
+              echo "::warning::Duplicate asset name ${name}; keeping ${seen[$name]}, skipping ${file}."
+              continue
+            fi
+            seen[$name]="$file"
+            unique_files+=("$file")
+          done
+
+          if [ "${#unique_files[@]}" -eq 0 ]; then
+            echo "::error::No unique artifacts to publish."
+            exit 1
+          fi
+
+          artifacts_csv="$(IFS=,; echo "${unique_files[*]}")"
+          echo "artifacts=${artifacts_csv}" >> "$GITHUB_OUTPUT"
+          echo "Will publish ${#unique_files[@]} unique artifacts."
+
+      - name: Upload to GitHub Release
         uses: ncipollo/release-action@v1
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
           allowUpdates: true
           replacesArtifacts: true
           makeLatest: true
-          # 将 release tag 绑定到本次实际构建的 commit
-          commit: ${{ needs.sync_and_prepare.outputs.build_ref }}
-          name: "Cherry Studio ${{ needs.sync_and_prepare.outputs.tag }}"
-          tag: ${{ needs.sync_and_prepare.outputs.tag }}
-          artifacts: "dist/*.exe,dist/*.zip,dist/*.dmg,dist/*.AppImage,dist/*.snap,dist/*.deb,dist/*.rpm,dist/*.tar.gz,dist/latest*.yml,dist/rc*.yml,dist/beta*.yml,dist/*.blockmap"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          commit: ${{ needs.prepare.outputs.build_ref }}
+          name: "Cherry Studio ${{ needs.prepare.outputs.tag }}"
+          tag: ${{ needs.prepare.outputs.tag }}
+          artifacts: ${{ steps.assets.outputs.artifacts }}
