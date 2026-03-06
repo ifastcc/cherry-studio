@@ -30,6 +30,7 @@ env:
   UPSTREAM_REPO: CherryHQ/cherry-studio
   NODE_VERSION: "22"
   ELECTRON_OFFICIAL_MIRROR: https://github.com/electron/electron/releases/download/
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
 
 jobs:
   prepare:
@@ -218,13 +219,14 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
-      - name: Force official Electron mirror in CI
+      - name: Configure CI download mirrors
         shell: bash
         run: |
           set -euo pipefail
           {
             echo "ELECTRON_MIRROR=${ELECTRON_OFFICIAL_MIRROR}"
             echo "npm_config_electron_mirror=${ELECTRON_OFFICIAL_MIRROR}"
+            echo "ELECTRON_BUILDER_BINARIES_MIRROR=${ELECTRON_BUILDER_BINARIES_MIRROR}"
           } >> "$GITHUB_ENV"
           perl -0pi -e 's#mirror:\s*https://npmmirror\.com/mirrors/electron/#mirror: https://github.com/electron/electron/releases/download/#g' electron-builder.yml
 
