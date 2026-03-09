@@ -42,6 +42,7 @@ import ObsidianSettings from './ObsidianSettings'
 import S3Settings from './S3Settings'
 import SiyuanSettings from './SiyuanSettings'
 import TopicSyncSettings from './TopicSyncSettings'
+import { getTopicSyncText } from './TopicSyncText'
 import WebDavSettings from './WebDavSettings'
 import YuqueSettings from './YuqueSettings'
 
@@ -53,6 +54,7 @@ const DataSettings: FC = () => {
   const { theme } = useTheme()
   const [menu, setMenu] = useState<string>('data')
   const { setTimeoutTimer } = useTimer()
+  const topicSyncText = getTopicSyncText(localStorage.getItem('language') || navigator.language)
 
   const _skipBackupFile = store.getState().settings.skipBackupFile
   const [skipBackupFile, setSkipBackupFile] = useState<boolean>(_skipBackupFile)
@@ -90,7 +92,7 @@ const DataSettings: FC = () => {
     { key: 'webdav', title: t('settings.data.webdav.title'), icon: <CloudSyncOutlined style={{ fontSize: 16 }} /> },
     {
       key: 'topic_sync',
-      title: t('settings.data.topic_sync.title', 'Topic Sync'),
+      title: topicSyncText.title,
       icon: <CloudSyncOutlined style={{ fontSize: 16 }} />
     },
     { key: 'nutstore', title: t('settings.data.nutstore.title'), icon: <NutstoreIcon /> },

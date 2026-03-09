@@ -3,13 +3,12 @@ import { HStack } from '@renderer/components/Layout'
 import { useTheme } from '@renderer/context/ThemeProvider'
 import { Alert, Button, Collapse, Input, Select, Tag } from 'antd'
 import dayjs from 'dayjs'
-import type { TFunction } from 'i18next'
 import type { FC } from 'react'
 import { useEffect, useMemo, useState } from 'react'
-import { useTranslation } from 'react-i18next'
 import styled from 'styled-components'
 
 import { SettingDivider, SettingGroup, SettingHelpText, SettingRow, SettingRowTitle, SettingTitle } from '..'
+import { getTopicSyncText, type TopicSyncText } from './TopicSyncText'
 
 const SYNC_SERVER_KEY = 'cherry-sync-server'
 const SYNC_TOKEN_KEY = 'cherry-sync-token'
@@ -275,44 +274,42 @@ function formatTimestamp(value: number | null): string {
   return dayjs(value).format('YYYY-MM-DD HH:mm:ss')
 }
 
-function formatIntervalLabel(ms: number): string {
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
-  return `${Math.round(ms / 60_000)}m`
+function formatIntervalLabel(ms: number, text: TopicSyncText): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}${text.units.secondsShort}`
+  return `${Math.round(ms / 60_000)}${text.units.minutesShort}`
 }
 
-function formatPullSummary(summary: PullSummary | null): string {
+function formatPullSummary(summary: PullSummary | null, text: TopicSyncText): string {
   if (!summary) return '-'
-  const blocked = summary.blockedSeq ? `, blockedSeq=${summary.blockedSeq}` : ''
+  const blocked = summary.blockedSeq ? `, ${text.diagnostics.blockedSeq}=${summary.blockedSeq}` : ''
   const resolved =
     summary.conflictResolvedLocal > 0 || summary.conflictResolvedServer > 0 || summary.writeBackQueued > 0
-      ? `, resolve(local=${summary.conflictResolvedLocal}, server=${summary.conflictResolvedServer}, writeBack=${summary.writeBackQueued})`
+      ? `, ${text.diagnostics.resolve}(${text.diagnostics.local}=${summary.conflictResolvedLocal}, ${text.diagnostics.server}=${summary.conflictResolvedServer}, ${text.diagnostics.writeBack}=${summary.writeBackQueued})`
       : ''
-  const skipped = summary.skipped > 0 ? `, skipped=${summary.skipped}` : ''
+  const skipped = summary.skipped > 0 ? `, ${text.diagnostics.skipped}=${summary.skipped}` : ''
   return (
-    `total=${summary.total}, safe=${summary.safe}, conflicts=${summary.conflicts}, ` +
-    `applied=${summary.applied}, cursor=${summary.nextCursor}${blocked}${resolved}${skipped}`
+    `${text.diagnostics.total}=${summary.total}, ${text.diagnostics.safe}=${summary.safe}, ${text.diagnostics.conflicts}=${summary.conflicts}, ` +
+    `${text.diagnostics.applied}=${summary.applied}, ${text.diagnostics.cursor}=${summary.nextCursor}${blocked}${resolved}${skipped}`
   )
 }
 
-function formatLastResult(result: SyncRuntimeResult | null): string {
+function formatLastResult(result: SyncRuntimeResult | null, text: TopicSyncText): string {
   if (!result) return '-'
   return (
     `+${result.added} ~${result.updated} -${result.deleted}; ` +
-    `applied=${result.applied}, noop=${result.noop}, stale=${result.stale}, failed=${result.failed}`
+    `${text.diagnostics.applied}=${result.applied}, ${text.diagnostics.noop}=${result.noop}, ${text.diagnostics.stale}=${result.stale}, ${text.diagnostics.failed}=${result.failed}`
   )
 }
 
-function sourceLabel(source: ConfigSource): string {
-  return source === 'localStorage' ? 'settings' : 'none'
+function sourceLabel(source: ConfigSource, text: TopicSyncText): string {
+  return source === 'localStorage' ? text.source.settings : text.source.none
 }
 
-function connectionTag(status: ConnectionStatus, t: TFunction) {
-  if (status === 'online') return <Tag color="success">{t('settings.data.topic_sync.connection.online', 'Online')}</Tag>
-  if (status === 'unauthorized')
-    return <Tag color="error">{t('settings.data.topic_sync.connection.unauthorized', 'Unauthorized')}</Tag>
-  if (status === 'offline')
-    return <Tag color="warning">{t('settings.data.topic_sync.connection.offline', 'Offline')}</Tag>
-  return <Tag>{t('settings.data.topic_sync.connection.unknown', 'Unknown')}</Tag>
+function connectionTag(status: ConnectionStatus, text: TopicSyncText) {
+  if (status === 'online') return <Tag color="success">{text.connection.online}</Tag>
+  if (status === 'unauthorized') return <Tag color="error">{text.connection.unauthorized}</Tag>
+  if (status === 'offline') return <Tag color="warning">{text.connection.offline}</Tag>
+  return <Tag>{text.connection.unknown}</Tag>
 }
 
 function summarizeFailureReasons(failures: SyncFailureItem[]): string {
@@ -346,51 +343,36 @@ function buildConflictPreview(conflicts: PullConflictItem[]): string {
     .join('\n')
 }
 
-function syncModeHelp(syncMode: SyncMode, t: TFunction): string {
-  if (syncMode === 'push_only') {
-    return t(
-      'settings.data.topic_sync.mode_help_push_only',
-      'Only push local updates to server. Use this when one device is source of truth.'
-    )
-  }
-  if (syncMode === 'manual_pull') {
-    return t(
-      'settings.data.topic_sync.mode_help_manual_pull',
-      'Push remains automatic, server pull is manual (preview/apply/resolve by buttons).'
-    )
-  }
-  if (syncMode === 'auto_safe') {
-    return t(
-      'settings.data.topic_sync.mode_help_auto_safe',
-      'Auto-pull only conflict-free server changes, pause at first conflict for manual handling.'
-    )
-  }
-  return t(
-    'settings.data.topic_sync.mode_help_auto_full',
-    'Auto pull and push. Conflicts are resolved by policy, then local changes can be written back.'
-  )
+function syncModeHelp(syncMode: SyncMode, text: TopicSyncText): string {
+  if (syncMode === 'push_only') return text.modeHelp.pushOnly
+  if (syncMode === 'manual_pull') return text.modeHelp.manualPull
+  if (syncMode === 'auto_safe') return text.modeHelp.autoSafe
+  return text.modeHelp.autoFull
 }
 
-function progressPhaseLabel(phase: SyncProgressState['phase']): string {
-  if (phase === 'pull') return 'Pull'
-  if (phase === 'push_upsert') return 'Push'
-  if (phase === 'push_delete') return 'Delete'
-  return 'Idle'
+function progressPhaseLabel(phase: SyncProgressState['phase'], text: TopicSyncText): string {
+  if (phase === 'pull') return text.progressPhase.pull
+  if (phase === 'push_upsert') return text.progressPhase.push
+  if (phase === 'push_delete') return text.progressPhase.delete
+  return text.progressPhase.idle
 }
 
 const TopicSyncSettings: FC = () => {
-  const { t } = useTranslation()
   const { theme } = useTheme()
   const [server, setServer] = useState('')
   const [token, setToken] = useState('')
+  const [language, setLanguage] = useState(() => localStorage.getItem('language') || navigator.language)
   const [runtime, setRuntime] = useState<SyncRuntimeState>(DEFAULT_RUNTIME_STATE)
+  const text = useMemo(() => getTopicSyncText(language), [language])
 
   useEffect(() => {
     setServer(localStorage.getItem(SYNC_SERVER_KEY) || '')
     setToken(localStorage.getItem(SYNC_TOKEN_KEY) || '')
+    setLanguage(localStorage.getItem('language') || navigator.language)
     setRuntime(parseRuntimeState(localStorage.getItem(SYNC_RUNTIME_KEY)))
 
     const handleRuntimeUpdate = () => {
+      setLanguage(localStorage.getItem('language') || navigator.language)
       setRuntime(parseRuntimeState(localStorage.getItem(SYNC_RUNTIME_KEY)))
     }
     const timer = setInterval(handleRuntimeUpdate, 1500)
@@ -417,9 +399,7 @@ const TopicSyncSettings: FC = () => {
     window.dispatchEvent(new Event('cherry-sync-runtime'))
     window.dispatchEvent(new Event('cherry-sync-check'))
     window.dispatchEvent(new Event('cherry-sync-force'))
-    window.toast.success(
-      t('settings.data.topic_sync.saved', 'Sync settings saved. Changes take effect on next sync cycle.')
-    )
+    window.toast.success(text.toasts.saved)
   }
 
   const clearOverrides = () => {
@@ -429,28 +409,23 @@ const TopicSyncSettings: FC = () => {
     setToken('')
     window.dispatchEvent(new Event('cherry-sync-runtime'))
     window.dispatchEvent(new Event('cherry-sync-check'))
-    window.toast.success(t('settings.data.topic_sync.cleared', 'Local overrides cleared.'))
+    window.toast.success(text.toasts.cleared)
   }
 
   const triggerSyncNow = () => {
     window.dispatchEvent(new Event('cherry-sync-force'))
-    window.toast.success(t('settings.data.topic_sync.triggered', 'Manual sync triggered.'))
+    window.toast.success(text.toasts.triggered)
   }
 
   const triggerFullPush = () => {
     window.modal.confirm({
       centered: true,
-      title: t('settings.data.topic_sync.full_push_title', 'Force Full Push to Server?'),
-      content: t(
-        'settings.data.topic_sync.full_push_content',
-        'This will clear local sync baseline and force-upload all local topics to the server.'
-      ),
-      okText: t('settings.data.topic_sync.full_push_confirm', 'Full Push'),
+      title: text.modals.fullPush.title,
+      content: text.modals.fullPush.content,
+      okText: text.modals.fullPush.confirm,
       onOk: () => {
         window.dispatchEvent(new Event('cherry-sync-push-full'))
-        window.toast.success(
-          t('settings.data.topic_sync.full_push_triggered', 'Full push triggered. Uploading all local topics...')
-        )
+        window.toast.success(text.modals.fullPush.triggered)
       }
     })
   }
@@ -458,28 +433,20 @@ const TopicSyncSettings: FC = () => {
   const triggerFullPushPrune = () => {
     window.modal.confirm({
       centered: true,
-      title: t('settings.data.topic_sync.full_push_prune_title', 'Force Full Push and Prune Remote Data?'),
-      content: t(
-        'settings.data.topic_sync.full_push_prune_content',
-        'This will force-upload all local topics and delete topics that exist on server but not in local data. This action is destructive for remote data.'
-      ),
-      okText: t('settings.data.topic_sync.full_push_prune_confirm', 'Full Push + Prune'),
+      title: text.modals.fullPushPrune.title,
+      content: text.modals.fullPushPrune.content,
+      okText: text.modals.fullPushPrune.confirm,
       okButtonProps: { danger: true },
       onOk: () => {
         window.dispatchEvent(new Event('cherry-sync-push-full-prune'))
-        window.toast.success(
-          t(
-            'settings.data.topic_sync.full_push_prune_triggered',
-            'Full push + prune triggered. Uploading local topics and pruning remote extras...'
-          )
-        )
+        window.toast.success(text.modals.fullPushPrune.triggered)
       }
     })
   }
 
   const checkConnection = () => {
     window.dispatchEvent(new Event('cherry-sync-check'))
-    window.toast.success(t('settings.data.topic_sync.checking', 'Checking connection...'))
+    window.toast.success(text.toasts.checking)
   }
 
   const setSyncMode = (mode: SyncMode) => {
@@ -491,7 +458,7 @@ const TopicSyncSettings: FC = () => {
     }))
     window.dispatchEvent(new CustomEvent('cherry-sync-set-mode', { detail: { mode: normalized } }))
     window.dispatchEvent(new Event('cherry-sync-runtime'))
-    window.toast.success(t('settings.data.topic_sync.mode_updated', 'Sync mode updated.'))
+    window.toast.success(text.toasts.modeUpdated)
   }
 
   const setSyncInterval = (intervalMs: number) => {
@@ -503,7 +470,7 @@ const TopicSyncSettings: FC = () => {
     }))
     window.dispatchEvent(new CustomEvent('cherry-sync-set-interval', { detail: { intervalMs: normalized } }))
     window.dispatchEvent(new Event('cherry-sync-runtime'))
-    window.toast.success(t('settings.data.topic_sync.interval_updated', 'Sync interval updated.'))
+    window.toast.success(text.toasts.intervalUpdated)
   }
 
   const setConflictPolicy = (policy: ConflictPolicy) => {
@@ -515,55 +482,48 @@ const TopicSyncSettings: FC = () => {
     }))
     window.dispatchEvent(new CustomEvent('cherry-sync-set-conflict-policy', { detail: { policy: normalized } }))
     window.dispatchEvent(new Event('cherry-sync-runtime'))
-    window.toast.success(t('settings.data.topic_sync.conflict_policy_updated', 'Conflict policy updated.'))
+    window.toast.success(text.toasts.conflictPolicyUpdated)
   }
 
   const triggerPullPreview = () => {
     window.dispatchEvent(new Event('cherry-sync-pull-preview'))
-    window.toast.success(t('settings.data.topic_sync.pull_preview_triggered', 'Pull preview started.'))
+    window.toast.success(text.toasts.pullPreviewTriggered)
   }
 
   const triggerPullApply = () => {
     window.dispatchEvent(new Event('cherry-sync-pull-apply'))
-    window.toast.success(t('settings.data.topic_sync.pull_apply_triggered', 'Safe pull apply started.'))
+    window.toast.success(text.toasts.pullApplyTriggered)
   }
 
   const resolveConflictsAsLocal = () => {
     window.dispatchEvent(new CustomEvent('cherry-sync-resolve-conflicts', { detail: { policy: 'local_wins' } }))
-    window.toast.success(
-      t('settings.data.topic_sync.resolve_local_triggered', 'Resolving conflicts with local wins and writing back...')
-    )
+    window.toast.success(text.toasts.resolveLocalTriggered)
   }
 
   const resolveConflictsAsServer = () => {
     window.dispatchEvent(new CustomEvent('cherry-sync-resolve-conflicts', { detail: { policy: 'server_wins' } }))
-    window.toast.success(
-      t('settings.data.topic_sync.resolve_server_triggered', 'Resolving conflicts with server wins...')
-    )
+    window.toast.success(text.toasts.resolveServerTriggered)
   }
 
   const retryFailedActions = () => {
     window.dispatchEvent(new Event('cherry-sync-retry-failed-actions'))
-    window.toast.success(t('settings.data.topic_sync.retry_failed_triggered', 'Retrying failed sync actions...'))
+    window.toast.success(text.toasts.retryFailedTriggered)
   }
 
   const dismissErrors = () => {
     window.dispatchEvent(new Event('cherry-sync-dismiss-errors'))
-    window.toast.success(t('settings.data.topic_sync.dismiss_errors', 'Sync errors cleared.'))
+    window.toast.success(text.toasts.dismissErrors)
   }
 
   const rebuildBaseline = () => {
     window.modal.confirm({
       centered: true,
-      title: t('settings.data.topic_sync.rebuild_baseline_title', 'Rebuild Local Sync Baseline?'),
-      content: t(
-        'settings.data.topic_sync.rebuild_baseline_content',
-        'This marks current local topics as already synced and clears the current failed queue.'
-      ),
-      okText: t('settings.data.topic_sync.rebuild_baseline_confirm', 'Rebuild'),
+      title: text.modals.rebuildBaseline.title,
+      content: text.modals.rebuildBaseline.content,
+      okText: text.modals.rebuildBaseline.confirm,
       onOk: () => {
         window.dispatchEvent(new Event('cherry-sync-rebuild-baseline'))
-        window.toast.success(t('settings.data.topic_sync.rebuild_baseline_done', 'Sync baseline rebuilt.'))
+        window.toast.success(text.toasts.rebuildBaselineDone)
       }
     })
   }
@@ -580,18 +540,18 @@ const TopicSyncSettings: FC = () => {
     )
     try {
       await navigator.clipboard.writeText(debugInfo)
-      window.toast.success(t('settings.data.topic_sync.copied', 'Sync debug info copied.'))
+      window.toast.success(text.toasts.copied)
     } catch {
-      window.toast.error(t('settings.data.topic_sync.copy_failed', 'Failed to copy debug info.'))
+      window.toast.error(text.toasts.copyFailed)
     }
   }
 
   const runtimeTag = runtime.running ? (
-    <Tag color="processing">{t('settings.data.topic_sync.status.running', 'Running')}</Tag>
+    <Tag color="processing">{text.status.running}</Tag>
   ) : runtime.configured ? (
-    <Tag color="success">{t('settings.data.topic_sync.status.ready', 'Ready')}</Tag>
+    <Tag color="success">{text.status.ready}</Tag>
   ) : (
-    <Tag>{t('settings.data.topic_sync.status.not_configured', 'Not configured')}</Tag>
+    <Tag>{text.status.notConfigured}</Tag>
   )
 
   const hasFailures = runtime.lastFailures.length > 0
@@ -601,10 +561,10 @@ const TopicSyncSettings: FC = () => {
   const progressPercent =
     progress.total > 0 ? Math.min(100, Math.round((Math.max(0, progress.processed) / progress.total) * 100)) : 0
   const progressText = runtime.running
-    ? `${progressPhaseLabel(progress.phase)} ${progress.processed}/${progress.total}${
-        progress.failed > 0 ? ` (failed=${progress.failed})` : ''
+    ? `${progressPhaseLabel(progress.phase, text)} ${progress.processed}/${progress.total}${
+        progress.failed > 0 ? ` (${text.failedInline(progress.failed)})` : ''
       }`
-    : 'Idle'
+    : text.progressPhase.idle
   const savedServer = localStorage.getItem(SYNC_SERVER_KEY) || ''
   const savedToken = localStorage.getItem(SYNC_TOKEN_KEY) || ''
   const hasUnsavedConfig = useMemo(() => {
@@ -614,52 +574,52 @@ const TopicSyncSettings: FC = () => {
   const summaryCards = [
     {
       key: 'status',
-      label: t('settings.data.topic_sync.status_label', 'Status'),
+      label: text.fields.status,
       value: runtimeTag
     },
     {
       key: 'connection',
-      label: t('settings.data.topic_sync.connection_label', 'Connection'),
+      label: text.fields.connection,
       value: (
         <HStack gap="8px" alignItems="center">
-          {connectionTag(runtime.connectionStatus, t)}
+          {connectionTag(runtime.connectionStatus, text)}
           {runtime.lastHttpStatus ? <span>HTTP {runtime.lastHttpStatus}</span> : null}
         </HStack>
       )
     },
     {
       key: 'lastSync',
-      label: t('settings.data.topic_sync.last_sync', 'Last Sync'),
+      label: text.fields.lastSync,
       value: formatTimestamp(runtime.lastSyncAt)
     },
     {
       key: 'lastPull',
-      label: t('settings.data.topic_sync.last_pull', 'Last Pull'),
+      label: text.fields.lastPull,
       value: formatTimestamp(runtime.lastPullAt)
     },
     {
       key: 'cursor',
-      label: t('settings.data.topic_sync.pull_cursor', 'Pull Cursor'),
+      label: text.fields.pullCursor,
       value: String(runtime.pullCursor)
     },
     {
       key: 'source',
-      label: t('settings.data.topic_sync.current_source', 'Current Source'),
-      value: sourceLabel(runtime.configSource)
+      label: text.fields.currentSource,
+      value: sourceLabel(runtime.configSource, text)
     },
     {
       key: 'interval',
-      label: t('settings.data.topic_sync.interval_label', 'Sync Interval'),
-      value: formatIntervalLabel(runtime.syncIntervalMs)
+      label: text.fields.interval,
+      value: formatIntervalLabel(runtime.syncIntervalMs, text)
     },
     {
       key: 'progress',
-      label: 'Progress',
+      label: text.progress,
       value: runtime.running ? `${progressPercent}% · ${progressText}` : progressText
     },
     {
       key: 'server',
-      label: t('settings.data.topic_sync.effective_server', 'Effective Server'),
+      label: text.fields.effectiveServer,
       value: runtime.server || '-'
     }
   ]
@@ -669,16 +629,11 @@ const TopicSyncSettings: FC = () => {
       <SettingTitle>
         <HStack gap="8px" alignItems="center">
           <SyncOutlined />
-          {t('settings.data.topic_sync.title', 'Topic Sync')}
+          {text.title}
         </HStack>
       </SettingTitle>
       <SettingRow>
-        <SettingHelpText>
-          {t(
-            'settings.data.topic_sync.precedence',
-            'Sync settings are saved in this page and take effect immediately after saving.'
-          )}
-        </SettingHelpText>
+        <SettingHelpText>{text.precedence}</SettingHelpText>
       </SettingRow>
       <SettingDivider />
 
@@ -692,8 +647,7 @@ const TopicSyncSettings: FC = () => {
               hasFailures ? (
                 <div>
                   <div>
-                    {t('settings.data.topic_sync.failed_reasons', 'Top failure reasons')}:{' '}
-                    {summarizeFailureReasons(runtime.lastFailures)}
+                    {text.failedReasons}: {summarizeFailureReasons(runtime.lastFailures)}
                   </div>
                   <PreviewText>{buildFailurePreview(runtime.lastFailures)}</PreviewText>
                 </div>
@@ -703,18 +657,18 @@ const TopicSyncSettings: FC = () => {
               hasFailures ? (
                 <ButtonRow>
                   <Button size="small" type="primary" disabled={!canOperate} onClick={retryFailedActions}>
-                    {t('settings.data.topic_sync.retry_failed', 'Retry Failed')}
+                    {text.actions.retryFailed}
                   </Button>
                   <Button size="small" onClick={dismissErrors}>
-                    {t('settings.data.topic_sync.dismiss_error', 'Dismiss')}
+                    {text.actions.dismiss}
                   </Button>
                   <Button size="small" onClick={rebuildBaseline}>
-                    {t('settings.data.topic_sync.rebuild_baseline', 'Rebuild Baseline')}
+                    {text.actions.rebuildBaseline}
                   </Button>
                 </ButtonRow>
               ) : (
                 <Button size="small" onClick={dismissErrors}>
-                  {t('settings.data.topic_sync.dismiss_error', 'Dismiss')}
+                  {text.actions.dismiss}
                 </Button>
               )
             }
@@ -728,17 +682,15 @@ const TopicSyncSettings: FC = () => {
           <Alert
             type="warning"
             showIcon
-            message={t('settings.data.topic_sync.pending_conflicts_count', '{{count}} pending conflicts', {
-              count: pendingConflictCount
-            })}
+            message={text.pendingConflictsMessage(pendingConflictCount)}
             description={<PreviewText>{buildConflictPreview(runtime.pendingConflicts)}</PreviewText>}
             action={
               <ButtonRow>
                 <Button size="small" disabled={!canOperate} onClick={resolveConflictsAsLocal}>
-                  {t('settings.data.topic_sync.resolve_local', 'Resolve Local Wins')}
+                  {text.actions.resolveLocal}
                 </Button>
                 <Button size="small" disabled={!canOperate} onClick={resolveConflictsAsServer}>
-                  {t('settings.data.topic_sync.resolve_server', 'Resolve Server Wins')}
+                  {text.actions.resolveServer}
                 </Button>
               </ButtonRow>
             }
@@ -748,9 +700,9 @@ const TopicSyncSettings: FC = () => {
       ) : null}
 
       <Section>
-        <SectionTitle>{t('settings.data.topic_sync.connection_section', 'Connection')}</SectionTitle>
+        <SectionTitle>{text.sections.connection}</SectionTitle>
         <SettingRow>
-          <SettingRowTitle>{t('settings.data.topic_sync.server', 'Sync Server')}</SettingRowTitle>
+          <SettingRowTitle>{text.fields.server}</SettingRowTitle>
           <Input
             value={server}
             onChange={(e) => setServer(e.target.value)}
@@ -759,24 +711,22 @@ const TopicSyncSettings: FC = () => {
           />
         </SettingRow>
         <SettingRow>
-          <SettingRowTitle>{t('settings.data.topic_sync.token', 'Sync Token')}</SettingRowTitle>
+          <SettingRowTitle>{text.fields.token}</SettingRowTitle>
           <Input.Password
             value={token}
             onChange={(e) => setToken(e.target.value)}
-            placeholder={t('settings.data.topic_sync.token_placeholder', 'Optional')}
+            placeholder={text.tokenPlaceholder}
             style={{ width: 340 }}
           />
         </SettingRow>
         <SettingRow>
-          <SettingRowTitle>{t('settings.data.topic_sync.actions', 'Actions')}</SettingRowTitle>
+          <SettingRowTitle>{text.fields.actions}</SettingRowTitle>
           <ButtonRow>
             <Button type={hasUnsavedConfig ? 'primary' : 'default'} onClick={saveConfig}>
-              {t('common.save', 'Save')}
+              {text.save}
             </Button>
-            <Button onClick={checkConnection}>
-              {t('settings.data.topic_sync.check_connection', 'Check Connection')}
-            </Button>
-            <Button onClick={clearOverrides}>{t('settings.data.topic_sync.clear', 'Clear Local Override')}</Button>
+            <Button onClick={checkConnection}>{text.actions.checkConnection}</Button>
+            <Button onClick={clearOverrides}>{text.actions.clear}</Button>
           </ButtonRow>
         </SettingRow>
       </Section>
@@ -784,88 +734,83 @@ const TopicSyncSettings: FC = () => {
       <SettingDivider />
 
       <Section>
-        <SectionTitle>{t('settings.data.topic_sync.strategy_section', 'Sync Strategy')}</SectionTitle>
+        <SectionTitle>{text.sections.strategy}</SectionTitle>
         <SettingRow>
-          <SettingRowTitle>{t('settings.data.topic_sync.mode_label', 'Sync Mode')}</SettingRowTitle>
+          <SettingRowTitle>{text.fields.mode}</SettingRowTitle>
           <Select
             value={runtime.syncMode}
             onChange={(value) => setSyncMode(value as SyncMode)}
             style={{ width: 240 }}
             options={[
-              { value: 'push_only', label: t('settings.data.topic_sync.mode.push_only', 'Push Only') },
-              { value: 'manual_pull', label: t('settings.data.topic_sync.mode.manual_pull', 'Manual Pull') },
-              { value: 'auto_safe', label: t('settings.data.topic_sync.mode.auto_safe', 'Auto Safe Pull') },
-              { value: 'auto_full', label: t('settings.data.topic_sync.mode.auto_full', 'Auto Full (Pull + Push)') }
+              { value: 'push_only', label: text.mode.pushOnly },
+              { value: 'manual_pull', label: text.mode.manualPull },
+              { value: 'auto_safe', label: text.mode.autoSafe },
+              { value: 'auto_full', label: text.mode.autoFull }
             ]}
           />
         </SettingRow>
         <SettingRow>
-          <SettingRowTitle>{t('settings.data.topic_sync.interval_label', 'Sync Interval')}</SettingRowTitle>
+          <SettingRowTitle>{text.fields.interval}</SettingRowTitle>
           <Select
             value={runtime.syncIntervalMs}
             onChange={(value) => setSyncInterval(value as number)}
             style={{ width: 240 }}
             options={[10_000, 30_000, 60_000, 300_000, 900_000, 1_800_000, 3_600_000].map((intervalMs) => ({
               value: intervalMs,
-              label: formatIntervalLabel(intervalMs)
+              label: formatIntervalLabel(intervalMs, text)
             }))}
           />
         </SettingRow>
         <SettingRow>
-          <SettingRowTitle>{t('settings.data.topic_sync.conflict_policy_label', 'Conflict Policy')}</SettingRowTitle>
+          <SettingRowTitle>{text.fields.conflictPolicy}</SettingRowTitle>
           <Select
             value={runtime.conflictPolicy}
             onChange={(value) => setConflictPolicy(value as ConflictPolicy)}
             style={{ width: 240 }}
             options={[
-              { value: 'local_wins', label: t('settings.data.topic_sync.conflict_policy.local_wins', 'Local Wins') },
-              { value: 'server_wins', label: t('settings.data.topic_sync.conflict_policy.server_wins', 'Server Wins') }
+              { value: 'local_wins', label: text.conflictPolicy.localWins },
+              { value: 'server_wins', label: text.conflictPolicy.serverWins }
             ]}
           />
         </SettingRow>
         <SettingRow>
-          <SettingHelpText>{syncModeHelp(runtime.syncMode, t)}</SettingHelpText>
+          <SettingHelpText>{syncModeHelp(runtime.syncMode, text)}</SettingHelpText>
         </SettingRow>
       </Section>
 
       <SettingDivider />
 
       <Section>
-        <SectionTitle>{t('settings.data.topic_sync.operation_section', 'Sync Operations')}</SectionTitle>
+        <SectionTitle>{text.sections.operations}</SectionTitle>
         <SettingRow>
-          <SettingRowTitle>{t('settings.data.topic_sync.sync_now', 'Sync Now')}</SettingRowTitle>
+          <SettingRowTitle>{text.fields.syncNow}</SettingRowTitle>
           <ButtonRow>
             <Button type="primary" disabled={!canOperate} onClick={triggerSyncNow}>
-              {t('settings.data.topic_sync.sync_now', 'Sync Now')}
+              {text.actions.syncNow}
             </Button>
             <Button danger disabled={!canOperate} onClick={triggerFullPush}>
-              {t('settings.data.topic_sync.full_push', 'Full Push')}
+              {text.actions.fullPush}
             </Button>
             <Button danger disabled={!canOperate} onClick={triggerFullPushPrune}>
-              {t('settings.data.topic_sync.full_push_prune', 'Full Push + Prune')}
+              {text.actions.fullPushPrune}
             </Button>
             <Button disabled={!canOperate} onClick={triggerPullPreview}>
-              {t('settings.data.topic_sync.pull_preview', 'Preview Pull')}
+              {text.actions.pullPreview}
             </Button>
             <Button disabled={!canOperate} onClick={triggerPullApply}>
-              {t('settings.data.topic_sync.pull_apply', 'Apply Safe Pull')}
+              {text.actions.pullApply}
             </Button>
           </ButtonRow>
         </SettingRow>
         <SettingRow>
-          <SettingHelpText>
-            {t(
-              'settings.data.topic_sync.pull_help',
-              'Preview analyzes server changes only. Apply Safe Pull writes non-conflicting changes and pauses at first conflict.'
-            )}
-          </SettingHelpText>
+          <SettingHelpText>{text.help.pull}</SettingHelpText>
         </SettingRow>
       </Section>
 
       <SettingDivider />
 
       <Section>
-        <SectionTitle>{t('settings.data.topic_sync.status_section', 'Status Overview')}</SectionTitle>
+        <SectionTitle>{text.sections.status}</SectionTitle>
         <SummaryGrid>
           {summaryCards.map((item) => (
             <SummaryCard key={item.key}>
@@ -883,35 +828,29 @@ const TopicSyncSettings: FC = () => {
         items={[
           {
             key: 'advanced',
-            label: t('settings.data.topic_sync.advanced', 'Advanced Diagnostics'),
+            label: text.advanced,
             children: (
               <Section>
                 <SettingRow>
-                  <SettingRowTitle>{t('settings.data.topic_sync.last_checked', 'Last Checked')}</SettingRowTitle>
+                  <SettingRowTitle>{text.fields.lastChecked}</SettingRowTitle>
                   <div style={{ color: 'var(--color-text-3)' }}>{formatTimestamp(runtime.lastCheckedAt)}</div>
                 </SettingRow>
                 <SettingRow>
-                  <SettingRowTitle>{t('settings.data.topic_sync.last_result', 'Last Result')}</SettingRowTitle>
+                  <SettingRowTitle>{text.fields.lastResult}</SettingRowTitle>
                   <div style={{ color: 'var(--color-text-3)', maxWidth: 520, textAlign: 'right' }}>
-                    {formatLastResult(runtime.lastResult)}
+                    {formatLastResult(runtime.lastResult, text)}
                   </div>
                 </SettingRow>
                 <SettingRow>
-                  <SettingRowTitle>
-                    {t('settings.data.topic_sync.last_pull_result', 'Last Pull Result')}
-                  </SettingRowTitle>
+                  <SettingRowTitle>{text.fields.lastPullResult}</SettingRowTitle>
                   <div style={{ color: 'var(--color-text-3)', maxWidth: 520, textAlign: 'right' }}>
-                    {formatPullSummary(runtime.lastPullSummary)}
+                    {formatPullSummary(runtime.lastPullSummary, text)}
                   </div>
                 </SettingRow>
                 <SettingRow>
-                  <SettingRowTitle>{t('settings.data.topic_sync.failed_items', 'Failed Items')}</SettingRowTitle>
+                  <SettingRowTitle>{text.fields.failedItems}</SettingRowTitle>
                   <Tag color={hasFailures ? 'error' : 'success'}>
-                    {hasFailures
-                      ? t('settings.data.topic_sync.failed_items_count', '{{count}} failed', {
-                          count: runtime.lastFailures.length
-                        })
-                      : t('settings.data.topic_sync.failed_items_none', 'No failed items')}
+                    {hasFailures ? text.failedItemsCount(runtime.lastFailures.length) : text.failedItemsNone}
                   </Tag>
                 </SettingRow>
                 {hasFailures ? (
@@ -920,15 +859,11 @@ const TopicSyncSettings: FC = () => {
                   </SettingRow>
                 ) : null}
                 <SettingRow>
-                  <SettingRowTitle>
-                    {t('settings.data.topic_sync.pending_conflicts', 'Pending Conflicts')}
-                  </SettingRowTitle>
+                  <SettingRowTitle>{text.fields.pendingConflicts}</SettingRowTitle>
                   <Tag color={pendingConflictCount > 0 ? 'warning' : 'success'}>
                     {pendingConflictCount > 0
-                      ? t('settings.data.topic_sync.pending_conflicts_count', '{{count}} pending', {
-                          count: pendingConflictCount
-                        })
-                      : t('settings.data.topic_sync.pending_conflicts_none', 'No pending conflicts')}
+                      ? text.pendingConflictsCount(pendingConflictCount)
+                      : text.pendingConflictsNone}
                   </Tag>
                 </SettingRow>
                 {pendingConflictCount > 0 ? (
@@ -937,17 +872,17 @@ const TopicSyncSettings: FC = () => {
                   </SettingRow>
                 ) : null}
                 <SettingRow>
-                  <SettingRowTitle>{t('settings.data.topic_sync.last_error', 'Last Error')}</SettingRowTitle>
+                  <SettingRowTitle>{text.fields.lastError}</SettingRowTitle>
                   <div
                     style={{ color: runtime.lastError ? 'var(--color-error)' : 'var(--color-text-3)', maxWidth: 520 }}>
                     {runtime.lastError || '-'}
                   </div>
                 </SettingRow>
                 <SettingRow>
-                  <SettingRowTitle>{t('settings.data.topic_sync.copy_debug', 'Copy Debug Info')}</SettingRowTitle>
+                  <SettingRowTitle>{text.fields.copyDebug}</SettingRowTitle>
                   <ButtonRow>
                     <Button icon={<ReloadOutlined />} onClick={copyDebugInfo}>
-                      {t('settings.data.topic_sync.copy_debug', 'Copy Debug Info')}
+                      {text.fields.copyDebug}
                     </Button>
                   </ButtonRow>
                 </SettingRow>
