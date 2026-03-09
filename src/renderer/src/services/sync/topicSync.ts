@@ -835,7 +835,11 @@ async function apiDeleteTopic(
     if (options?.force) {
       headers['X-Sync-Force'] = '1'
     }
-    if (typeof options?.expectedRevision === 'number' && Number.isFinite(options.expectedRevision) && options.expectedRevision > 0) {
+    if (
+      typeof options?.expectedRevision === 'number' &&
+      Number.isFinite(options.expectedRevision) &&
+      options.expectedRevision > 0
+    ) {
       headers['X-Sync-If-Revision'] = String(Math.floor(options.expectedRevision))
     }
 
@@ -1221,6 +1225,8 @@ function normalizeIncomingTopic(
   const updatedAt = incoming.updatedAt != null ? toIsoString(incoming.updatedAt) : createdAt
 
   const blockMap = new Map<string, MessageBlock>()
+  const seenUserMessageIds = new Set<string>()
+  let lastUserMessageId: string | undefined
   const messages: NewMessage[] = (Array.isArray(incoming.messages) ? incoming.messages : []).map((message, index) => {
     const messageRecord: Record<string, unknown> = isRecord(message) ? message : {}
     const messageId =
@@ -1255,7 +1261,12 @@ function normalizeIncomingTopic(
       blockIds.push(blockId)
     }
 
-    const { blocks: _incomingBlocks, ...messageMeta } = messageRecord
+    // Normalize askId at sync boundary: assistant.askId must point to the triggering user message id.
+    const rawAskId =
+      typeof messageRecord.askId === 'string' && messageRecord.askId.trim() ? messageRecord.askId.trim() : undefined
+    const normalizedAskId =
+      role === 'assistant' ? (rawAskId && seenUserMessageIds.has(rawAskId) ? rawAskId : lastUserMessageId) : undefined
+    const { blocks: _incomingBlocks, askId: _incomingAskId, ...messageMeta } = messageRecord
 
     const normalizedMessage: NewMessage = {
       ...(messageMeta as Partial<NewMessage>),
@@ -1273,7 +1284,13 @@ function normalizeIncomingTopic(
             : undefined,
       status: toMessageStatus(messageRecord.status),
       mentions: Array.isArray(messageRecord.mentions) ? messageRecord.mentions : undefined,
-      blocks: blockIds
+      blocks: blockIds,
+      ...(normalizedAskId ? { askId: normalizedAskId } : {})
+    }
+
+    if (role === 'user') {
+      seenUserMessageIds.add(messageId)
+      lastUserMessageId = messageId
     }
 
     return normalizedMessage
