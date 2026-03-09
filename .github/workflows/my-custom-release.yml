@@ -168,21 +168,10 @@ jobs:
           set -euo pipefail
           echo "build_ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-  build:
+  build_mac:
     needs: prepare
     if: needs.prepare.outputs.should_build == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            platform: mac
-          - os: windows-latest
-            platform: windows
-          - os: ubuntu-latest
-            platform: linux
+    runs-on: macos-latest
     steps:
       - name: Check out build ref
         uses: actions/checkout@v6
@@ -231,31 +220,13 @@ jobs:
           pnpm install --frozen-lockfile
 
       - name: macOS dependencies fix
-        if: matrix.platform == 'mac'
         shell: bash
         run: |
           set -euo pipefail
           brew install python-setuptools || true
           python3 -m pip install --user setuptools || true
 
-      - name: Build Linux
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y rpm
-          pnpm build:linux --publish never
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_OPTIONS: --max-old-space-size=8192
-          MAIN_VITE_CHERRYAI_CLIENT_SECRET: ${{ secrets.MAIN_VITE_CHERRYAI_CLIENT_SECRET }}
-          MAIN_VITE_MINERU_API_KEY: ${{ secrets.MAIN_VITE_MINERU_API_KEY }}
-          RENDERER_VITE_AIHUBMIX_SECRET: ${{ secrets.RENDERER_VITE_AIHUBMIX_SECRET }}
-          RENDERER_VITE_PPIO_APP_SECRET: ${{ secrets.RENDERER_VITE_PPIO_APP_SECRET }}
-
       - name: Build macOS
-        if: matrix.platform == 'mac'
         shell: bash
         run: |
           set -euo pipefail
@@ -273,8 +244,102 @@ jobs:
           RENDERER_VITE_AIHUBMIX_SECRET: ${{ secrets.RENDERER_VITE_AIHUBMIX_SECRET }}
           RENDERER_VITE_PPIO_APP_SECRET: ${{ secrets.RENDERER_VITE_PPIO_APP_SECRET }}
 
+      - name: Collect release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+
+          patterns=(
+            dist/*.exe
+            dist/*.zip
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.snap
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/latest*.yml
+            dist/rc*.yml
+            dist/beta*.yml
+            dist/*.blockmap
+          )
+
+          copied=0
+          for pattern in "${patterns[@]}"; do
+            for file in $pattern; do
+              cp "$file" "release-assets/$(basename "$file")"
+              copied=$((copied + 1))
+            done
+          done
+
+          if [ "$copied" -eq 0 ]; then
+            echo "::error::No release artifacts were found in dist/ for ${RUNNER_OS}."
+            exit 1
+          fi
+
+          echo "Collected ${copied} artifacts for ${RUNNER_OS}."
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-mac
+          path: release-assets/*
+          if-no-files-found: error
+
+  build_windows:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Check out build ref
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.build_ref }}
+
+      - name: Verify topic sync patch exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
+          grep -q "key: 'topic_sync'" src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
+          grep -q '"topic_sync"' src/renderer/src/i18n/locales/zh-cn.json
+
+      - name: Set package.json version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.tag }}"
+          VERSION="${TAG#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.27.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Configure CI download mirrors
+        shell: bash
+        run: |
+          set -euo pipefail
+          perl -0pi -e 's#mirror:\s*https://npmmirror\.com/mirrors/electron/#mirror: '"${ELECTRON_OFFICIAL_MIRROR}"'#g' electron-builder.yml
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+
       - name: Build Windows
-        if: matrix.platform == 'windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -327,12 +392,214 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-assets-${{ matrix.platform }}
+          name: release-assets-windows
           path: release-assets/*
           if-no-files-found: error
 
-  publish_release:
-    needs: [prepare, build]
+  build_linux:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out build ref
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.build_ref }}
+
+      - name: Verify topic sync patch exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
+          grep -q "key: 'topic_sync'" src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
+          grep -q '"topic_sync"' src/renderer/src/i18n/locales/zh-cn.json
+
+      - name: Set package.json version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.tag }}"
+          VERSION="${TAG#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.27.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Configure CI download mirrors
+        shell: bash
+        run: |
+          set -euo pipefail
+          perl -0pi -e 's#mirror:\s*https://npmmirror\.com/mirrors/electron/#mirror: '"${ELECTRON_OFFICIAL_MIRROR}"'#g' electron-builder.yml
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+
+      - name: Build Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          pnpm build:linux --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --max-old-space-size=8192
+          MAIN_VITE_CHERRYAI_CLIENT_SECRET: ${{ secrets.MAIN_VITE_CHERRYAI_CLIENT_SECRET }}
+          MAIN_VITE_MINERU_API_KEY: ${{ secrets.MAIN_VITE_MINERU_API_KEY }}
+          RENDERER_VITE_AIHUBMIX_SECRET: ${{ secrets.RENDERER_VITE_AIHUBMIX_SECRET }}
+          RENDERER_VITE_PPIO_APP_SECRET: ${{ secrets.RENDERER_VITE_PPIO_APP_SECRET }}
+
+      - name: Collect release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+
+          patterns=(
+            dist/*.exe
+            dist/*.zip
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.snap
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/latest*.yml
+            dist/rc*.yml
+            dist/beta*.yml
+            dist/*.blockmap
+          )
+
+          copied=0
+          for pattern in "${patterns[@]}"; do
+            for file in $pattern; do
+              cp "$file" "release-assets/$(basename "$file")"
+              copied=$((copied + 1))
+            done
+          done
+
+          if [ "$copied" -eq 0 ]; then
+            echo "::error::No release artifacts were found in dist/ for ${RUNNER_OS}."
+            exit 1
+          fi
+
+          echo "Collected ${copied} artifacts for ${RUNNER_OS}."
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-linux
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish_release_mac:
+    needs: [prepare, build_mac]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets-mac
+          path: release-assets/mac
+
+      - name: Delete existing GitHub Release and stale tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.tag }}"
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Deleting existing release ${TAG} before recreating it."
+            gh release delete "${TAG}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag
+          else
+            echo "No existing release ${TAG} found."
+          fi
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Deleting stale tag ref ${TAG}."
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}"
+          fi
+
+          for attempt in {1..15}; do
+            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+              echo "Waiting for remote tag ${TAG} to disappear (${attempt}/15)..."
+              sleep 2
+            else
+              break
+            fi
+          done
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Remote tag ${TAG} still exists after cleanup."
+            exit 1
+          fi
+
+      - name: Create GitHub Release with macOS artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t files < <(find release-assets/mac -type f | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No macOS artifacts downloaded."
+            exit 1
+          fi
+
+          gh release create "${{ needs.prepare.outputs.tag }}" "${files[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Cherry Studio ${{ needs.prepare.outputs.tag }}" \
+            --target "${{ needs.prepare.outputs.build_ref }}" \
+            --latest
+
+  publish_release_windows:
+    needs: [prepare, build_windows, publish_release_mac]
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets-windows
+          path: release-assets/windows
+
+      - name: Upload Windows artifacts to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t files < <(find release-assets/windows -type f | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No Windows artifacts downloaded."
+            exit 1
+          fi
+
+          gh release upload "${{ needs.prepare.outputs.tag }}" "${files[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+  publish_release_linux:
+    needs: [prepare, build_linux, publish_release_mac]
     if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -342,61 +609,19 @@ jobs:
           name: release-assets-linux
           path: release-assets/linux
 
-      - name: Download macOS artifacts
-        uses: actions/download-artifact@v5
-        with:
-          name: release-assets-mac
-          path: release-assets/mac
-
-      - name: Download Windows artifacts
-        uses: actions/download-artifact@v5
-        with:
-          name: release-assets-windows
-          path: release-assets/windows
-
-      - name: Build unique artifact list
-        id: assets
+      - name: Upload Linux artifacts to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t files < <(find release-assets -type f | sort)
+          mapfile -t files < <(find release-assets/linux -type f | sort)
           if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::No artifacts downloaded."
+            echo "::error::No Linux artifacts downloaded."
             exit 1
           fi
 
-          declare -A seen=()
-          unique_files=()
-
-          for file in "${files[@]}"; do
-            name="$(basename "$file")"
-            if [ -n "${seen[$name]:-}" ]; then
-              echo "::warning::Duplicate asset name ${name}; keeping ${seen[$name]}, skipping ${file}."
-              continue
-            fi
-            seen[$name]="$file"
-            unique_files+=("$file")
-          done
-
-          if [ "${#unique_files[@]}" -eq 0 ]; then
-            echo "::error::No unique artifacts to publish."
-            exit 1
-          fi
-
-          artifacts_csv="$(IFS=,; echo "${unique_files[*]}")"
-          echo "artifacts=${artifacts_csv}" >> "$GITHUB_OUTPUT"
-          echo "Will publish ${#unique_files[@]} unique artifacts."
-
-      - name: Upload to GitHub Release
-        uses: ncipollo/release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          draft: false
-          allowUpdates: true
-          replacesArtifacts: true
-          makeLatest: true
-          commit: ${{ needs.prepare.outputs.build_ref }}
-          name: "Cherry Studio ${{ needs.prepare.outputs.tag }}"
-          tag: ${{ needs.prepare.outputs.tag }}
-          artifacts: ${{ steps.assets.outputs.artifacts }}
+          gh release upload "${{ needs.prepare.outputs.tag }}" "${files[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
