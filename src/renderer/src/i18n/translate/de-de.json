@@ -7,7 +7,9 @@
         "invalid_agent": "Ungültiger Agent"
       },
       "model": {
-        "tooltip": "Derzeit sind für die Agent-Funktion nur Modelle verfügbar, die Anthropic-Endpunkte unterstützen."
+        "supported_providers": "Unterstützte Anbieter",
+        "tooltip": "Derzeit sind für die Agent-Funktion nur Modelle verfügbar, die Anthropic-Endpunkte unterstützen.",
+        "view_providers": "Unterstützte Anbieter anzeigen"
       },
       "title": "Agent hinzufügen",
       "type": {
@@ -135,6 +137,11 @@
     },
     "settings": {
       "advance": {
+        "envVars": {
+          "description": "Legen Sie benutzerdefinierte Umgebungsvariablen für die Agent-Laufzeit fest.",
+          "helper": "Benutzerdefinierte Umgebungsvariablen eingeben (eine pro Zeile, Format: SCHLÜSSEL=wert)",
+          "label": "Umgebungsvariablen"
+        },
         "maxTurns": {
           "description": "Legen Sie die Anzahl der Anfrage-/Antwort-Runden fest, die der Agent automatisch ausführt.",
           "helper": "Höhere Werte ermöglichen längere autonome Ausführung; niedrigere Werte bieten bessere Kontrolle.",
@@ -284,7 +291,7 @@
         },
         "tab": "Tools",
         "tools": {
-          "title": "Werkzeuge"
+          "title": "Vorab genehmigte Tools"
         }
       }
     },
@@ -1487,7 +1494,6 @@
     "originalError": "Ursprünglicher Fehler",
     "originalMessage": "Ursprüngliche Nachricht",
     "parameter": "Parameter",
-    "pause_placeholder": "Unterbrochen",
     "prompt": "Prompt",
     "provider": "Anbieter",
     "providerId": "Anbieter-ID",
@@ -1501,6 +1507,7 @@
     "requestBody": "Anfrage-Inhalt",
     "requestBodyValues": "Anfrage-Body",
     "requestUrl": "Anfrage-URL",
+    "request_timeout": "Anforderung Zeitüberschreitung",
     "response": "Antwort",
     "responseBody": "Antwort-Inhalt",
     "responseHeaders": "Antwort-Header",
@@ -1510,6 +1517,7 @@
     "status": "Statuscode",
     "statusCode": "Statuscode",
     "statusText": "Statustext",
+    "stream_paused": "Unterbrochen",
     "text": "Text",
     "toolInput": "Tool-Eingabe",
     "toolName": "Tool-Name",
@@ -2147,6 +2155,7 @@
     "tools": {
       "abort_failed": "Tool-Aufruf abbrechen fehlgeschlagen",
       "aborted": "Tool-Aufruf abgebrochen",
+      "approvalRequired": "Das Tool \"{{tool}}\" erfordert eine Genehmigung",
       "autoApproveEnabled": "Automatische Genehmigung für dieses Tool aktiviert",
       "cancelled": "Abgebrochen",
       "completed": "Abgeschlossen",
@@ -2283,7 +2292,10 @@
     "dangbei": "Dangbei AI",
     "doubao": "Doubao",
     "hailuo": "Hailuo",
+    "ima": "ima",
     "metaso": "Metaso AI-Suche",
+    "minimax-agent": "MiniMax Agent CN",
+    "minimax-global": "MiniMax Agent",
     "nami-ai": "Nami AI",
     "nami-ai-search": "Nami AI-Suche",
     "qwen": "Qwen",
@@ -2521,6 +2533,9 @@
   "notification": {
     "assistant": "Assistenten-Antwort",
     "knowledge": {
+      "batch_error": "{{failed}} Elemente konnten nicht verarbeitet werden",
+      "batch_mixed": "{{succeeded}} Elemente erfolgreich, {{failed}} Elemente fehlgeschlagen",
+      "batch_success": "{{succeeded}} Elemente erfolgreich verarbeitet",
       "error": "{{error}}",
       "success": "{{type}} erfolgreich zur Wissensdatenbank hinzugefügt"
     },
@@ -3041,7 +3056,8 @@
     "lmstudio": "LM Studio",
     "longcat": "Meißner Riesenhamster",
     "mimo": "Xiaomi MiMo",
-    "minimax": "MiniMax",
+    "minimax": "MiniMax CN",
+    "minimax-global": "MiniMax",
     "mistral": "Mistral",
     "modelscope": "ModelScope",
     "moonshot": "Moonshot AI",
@@ -3069,6 +3085,7 @@
     "voyageai": "Voyage AI",
     "xirang": "China Telecom Cloud Xirang",
     "yi": "01.AI",
+    "zai": "Z.ai",
     "zhinao": "360 Zhinao",
     "zhipu": "Zhipu AI"
   },
@@ -4950,6 +4967,7 @@
         "logout_failed": "Abmeldung fehlgeschlagen, bitte erneut versuchen",
         "logout_success": "Erfolgreich abgemeldet von Anthropic",
         "oauth": "Web OAuth",
+        "oauth_disabled_warning": "Anthropic hat die Nutzung von Claude über OAuth vorübergehend eingestellt. Diese Authentifizierungsmethode ist derzeit nicht verfügbar. Bitte verwenden Sie vorerst einen API-Schlüssel.",
         "start_auth": "Autorisierung starten",
         "submit_code": "Anmeldung abschließen"
       },
@@ -5110,6 +5128,11 @@
       },
       "docs_check": "Anzeigen",
       "docs_more_details": "Weitere Details anzeigen",
+      "filter": {
+        "agent": "Vom Agenten unterstützt",
+        "all": "Alle Anbieter"
+      },
+      "filter_agent": "Von Filter-Agent unterstützte Anbieter",
       "get_api_key": "Hier klicken um Schlüssel zu erhalten",
       "misc": "Sonstige",
       "no_models_for_check": "Keine testbaren Modelle (z.B. Chat-Modelle)",

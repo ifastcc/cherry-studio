@@ -230,13 +230,11 @@ class OpenClawService {
   }
 
   /**
-   * Install OpenClaw using npm with China mirror acceleration
-   * For users in China, install @qingchencloud/openclaw-zh package instead
+   * Install OpenClaw using npm with China mirror acceleration for users in China
    */
   public async install(): Promise<{ success: boolean; message: string }> {
     const inChina = await isUserInChina()
-
-    const packageName = inChina ? '@qingchencloud/openclaw-zh@latest' : 'openclaw@latest'
+    const packageName = 'openclaw@latest'
     const registryArg = inChina ? `--registry=${NPM_MIRROR_CN}` : ''
 
     const npmPath = (await findExecutableInEnv('npm')) || 'npm'
@@ -244,8 +242,14 @@ class OpenClawService {
     const npmArgs = ['install', '-g', packageName]
     if (registryArg) npmArgs.push(registryArg)
 
-    // Keep the command string for logging and sudo retry
-    const npmCommand = `"${npmPath}" install -g ${packageName} ${registryArg}`.trim()
+    // Keep the command string for logging and sudo retry.
+    // On macOS/Linux, prepend npm's parent dir to PATH so that sudo (which runs in a
+    // clean environment without user PATH) can resolve `node` via npm's shebang
+    // (#!/usr/bin/env node).
+    const nodeDir = path.dirname(npmPath)
+    const npmCommand = isWin
+      ? `"${npmPath}" install -g ${packageName} ${registryArg}`.trim()
+      : `PATH="${nodeDir}:$PATH" "${npmPath}" install -g ${packageName} ${registryArg}`.trim()
 
     // On Windows, wrap npm path in quotes if it contains spaces and is not already quoted
     const needsQuotes = isWin && npmPath.includes(' ') && !npmPath.startsWith('"')
@@ -335,7 +339,7 @@ class OpenClawService {
 
   /**
    * Uninstall OpenClaw using npm
-   * Uninstalls both the standard and Chinese packages to ensure clean removal
+   * Uninstalls both openclaw and legacy @qingchencloud/openclaw-zh package
    */
   public async uninstall(): Promise<{ success: boolean; message: string }> {
     // First stop the gateway if running
@@ -347,8 +351,12 @@ class OpenClawService {
 
     const npmArgs = ['uninstall', '-g', 'openclaw', '@qingchencloud/openclaw-zh']
 
-    // Keep the command string for logging and sudo retry
-    const npmCommand = `"${npmPath}" uninstall -g openclaw @qingchencloud/openclaw-zh`
+    // Keep the command string for logging and sudo retry.
+    // On macOS/Linux, prepend npm's parent dir to PATH so that sudo can resolve `node`.
+    const nodeDir = path.dirname(npmPath)
+    const npmCommand = isWin
+      ? `"${npmPath}" uninstall -g openclaw @qingchencloud/openclaw-zh`
+      : `PATH="${nodeDir}:$PATH" "${npmPath}" uninstall -g openclaw @qingchencloud/openclaw-zh`
 
     // On Windows, wrap npm path in quotes if it contains spaces and is not already quoted
     const needsQuotes = isWin && npmPath.includes(' ') && !npmPath.startsWith('"')

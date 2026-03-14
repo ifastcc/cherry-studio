@@ -103,6 +103,7 @@ const ThinkModelTypes = [
   'gpt5_codex',
   'gpt5_1_codex',
   'gpt5_1_codex_max',
+  'gpt5_2_codex',
   'gpt5_2',
   'gpt5pro',
   'gpt52pro',
@@ -679,6 +680,7 @@ export const WebSearchProviderIds = {
   exa: 'exa',
   'exa-mcp': 'exa-mcp',
   bocha: 'bocha',
+  querit: 'querit',
   'local-google': 'local-google',
   'local-bing': 'local-bing',
   'local-baidu': 'local-baidu'
