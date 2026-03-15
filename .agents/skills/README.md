@@ -62,15 +62,20 @@ The sync/check scripts manage and verify:
 Public skills in this repository can also be installed and managed with
 [`vercel-labs/skills`](https://github.com/vercel-labs/skills).
 
+Some end-user skills may live in separate repositories.
+For example, `cherry-chat-research` is now maintained in:
+
+- `https://github.com/ifastcc/cherry-skills`
+
 Example:
 
 ```bash
-npx skills add ifastcc/cherry-studio --skill cherry-chat-research -a codex -a claude-code
+npx skills add ifastcc/cherry-skills --skill cherry-chat-research -a codex -a claude-code
 npx skills check
 npx skills update
 ```
 
-Use repository-native workflows for authoring and review:
+Use repository-native workflows for skills that still live here:
 
 - edit under `.agents/skills`
 - keep `public-skills.txt` as the whitelist

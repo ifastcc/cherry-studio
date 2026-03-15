@@ -3,11 +3,6 @@
 *
 !.gitignore
 !README*.md
-!cherry-chat-research/
-!cherry-chat-research/**
-cherry-chat-research/**/__pycache__/
-cherry-chat-research/**/*.py[cod]
-cherry-chat-research/**/.DS_Store
 !create-skill/
 !create-skill/**
 create-skill/**/__pycache__/

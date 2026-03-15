@@ -2,7 +2,7 @@
 
 如果你只想知道这个 Fork 和上游版有什么区别，可以先记一句话：
 
-- 它在原版 Cherry Studio 上，多了三样更适合本地 Agent 工作流的东西：`Topic 同步`、`对外 History / MCP API`、`cherry-chat-research` 技能。
+- 它在原版 Cherry Studio 上，多了三样更适合本地 Agent 工作流的东西：`Topic 同步`、`对外 History / MCP API`，以及一个单独维护的 `cherry-chat-research` 技能仓库。
 
 这份说明不讲设计理念，只讲你能拿它做什么，以及从哪里开始。
 
@@ -80,6 +80,10 @@
 
 ## 3. `cherry-chat-research` 技能
 
+这个 skill 现在单独维护在：
+
+- `https://github.com/ifastcc/cherry-skills`
+
 这个 skill 不是固定报表生成器。
 
 它更像一个“聊天历史研究员”：
@@ -94,7 +98,7 @@
 安装：
 
 ```bash
-npx skills add ifastcc/cherry-studio --skill cherry-chat-research -a codex -a claude-code
+npx skills add ifastcc/cherry-skills --skill cherry-chat-research -a codex -a claude-code
 ```
 
 使用前先做两步：
@@ -105,6 +109,8 @@ npx skills add ifastcc/cherry-studio --skill cherry-chat-research -a codex -a cl
 大多数情况下，不用再手动设置环境变量。
 
 这个 Fork 会把本地连接信息写到一个连接文件里，skill 会优先自动发现它。
+
+如果你之前是从 `ifastcc/cherry-studio` 安装的旧版本，重新跑一遍上面的安装命令就行。
 
 如果自动发现失败，再手动指定：
 

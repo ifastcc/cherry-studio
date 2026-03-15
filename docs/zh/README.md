@@ -68,7 +68,7 @@
 
 Cherry Studio 是一款支持多个大语言模型（LLM）服务商的桌面客户端，兼容 Windows、Mac 和 Linux 系统。
 
-> Fork 说明：这个 Fork 额外增加了 Topic 同步、对外 History / MCP 能力，以及聊天历史研究技能。怎么开、怎么配、怎么用，见 [FORK_FEATURES.md](../../FORK_FEATURES.md)。
+> Fork 说明：这个 Fork 额外增加了 Topic 同步、对外 History / MCP 能力，并配套了单独维护的聊天历史研究技能仓库。怎么开、怎么配、怎么用，见 [FORK_FEATURES.md](../../FORK_FEATURES.md)。
 
 👏 欢迎加入 [Telegram 群组](https://t.me/CherryStudioAI)｜[Discord](https://discord.gg/wez8HtpxqQ) | [QQ群(575014769)](https://qm.qq.com/q/lo0D4qVZKi)
 

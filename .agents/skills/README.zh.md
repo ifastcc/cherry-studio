@@ -62,15 +62,20 @@ pnpm skills:check
 仓库里的公共 skill 也可以通过
 [`vercel-labs/skills`](https://github.com/vercel-labs/skills) 进行安装和更新管理。
 
+有些面向最终用户的 skill 会单独维护在独立仓库里。
+例如，`cherry-chat-research` 现在维护在：
+
+- `https://github.com/ifastcc/cherry-skills`
+
 示例：
 
 ```bash
-npx skills add ifastcc/cherry-studio --skill cherry-chat-research -a codex -a claude-code
+npx skills add ifastcc/cherry-skills --skill cherry-chat-research -a codex -a claude-code
 npx skills check
 npx skills update
 ```
 
-仓库内仍然保持现有的维护方式：
+仍然留在当前仓库内的 skills，则继续沿用现有维护方式：
 
 - 所有源码都在 `.agents/skills`
 - `public-skills.txt` 仍然是公共白名单
