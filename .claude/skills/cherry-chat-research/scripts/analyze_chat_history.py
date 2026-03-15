@@ -1,342 +1,410 @@
 #!/usr/bin/env python3
-"""Generate a Markdown research report from Cherry Studio chat history."""
+"""Export a local research workspace from Cherry Studio history data."""
 
 from __future__ import annotations
 
 import argparse
-import collections
 import datetime as dt
-import math
-import os
+import json
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Tuple
+import shutil
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence
 
 from cherry_history_client import CherryHistoryClient
 
 
-STOPWORDS = {
-    "the",
-    "and",
-    "for",
-    "that",
-    "this",
-    "with",
-    "from",
-    "have",
-    "will",
-    "would",
-    "there",
-    "what",
-    "about",
-    "please",
-    "帮我",
-    "这个",
-    "那个",
-    "就是",
-    "可以",
-    "一下",
-    "因为",
-    "所以",
-    "然后",
-    "如果",
-    "已经",
-    "还是",
-    "没有",
-    "自己",
-    "觉得",
-    "问题",
-    "怎么",
-    "如何",
-}
-
-HEDGE_TERMS = {"可能", "也许", "似乎", "大概", "maybe", "perhaps", "probably", "might", "seems"}
-CERTAINTY_TERMS = {"必须", "一定", "显然", "肯定", "definitely", "must", "clearly", "certainly"}
-CAUSAL_TERMS = {"因为", "所以", "导致", "因此", "because", "therefore", "cause", "result"}
-PLANNING_TERMS = {"先", "再", "之后", "长期", "短期", "计划", "later", "next", "plan", "roadmap"}
-COMPARISON_TERMS = {"更", "相比", "取舍", "利弊", "better", "worse", "tradeoff", "compare"}
-EMOTION_TERMS = {
-    "anxiety": {"焦虑", "紧张", "担心", "stress", "worried", "anxious"},
-    "frustration": {"烦", "难受", "崩溃", "frustrated", "annoyed"},
-    "positive": {"开心", "满意", "兴奋", "happy", "glad", "excited"},
-}
-VALUE_TERMS = {
-    "efficiency": {"效率", "省时", "高效", "efficient", "speed"},
-    "control": {"控制", "掌控", "可控", "control", "stable"},
-    "growth": {"成长", "学习", "提升", "growth", "learn", "improve"},
-    "freedom": {"自由", "灵活", "free", "flexible"},
-    "responsibility": {"责任", "负责", "responsibility", "ownership"},
-}
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze Cherry Studio chat history")
+    parser = argparse.ArgumentParser(description="Export a Cherry Studio chat-history research workspace")
+    parser.add_argument("--output-dir", default="/tmp/cherry-chat-research-workspace")
     parser.add_argument("--topic-limit", type=int, default=20)
     parser.add_argument("--assistant-id")
     parser.add_argument("--keyword")
+    parser.add_argument("--topic-id", action="append", dest="topic_ids")
+    parser.add_argument("--search", action="append", dest="search_queries")
     parser.add_argument("--message-limit-per-page", type=int, default=200)
-    parser.add_argument("--output")
+    parser.add_argument("--response-selection", choices=["all", "preferred"], default="all")
+    parser.add_argument("--transcript-order", choices=["asc", "desc"], default="asc")
     return parser.parse_args()
 
 
-def tokenize(text: str) -> List[str]:
-    english = re.findall(r"[A-Za-z]{2,}", text.lower())
-    chinese_chunks = re.findall(r"[\u4e00-\u9fff]{2,}", text)
-    chinese = []
-    for chunk in chinese_chunks:
-        if len(chunk) <= 3:
-            chinese.append(chunk)
-            continue
-        chinese.extend(chunk[index : index + 2] for index in range(len(chunk) - 1))
-    tokens = [token for token in english + chinese if token not in STOPWORDS and not token.isdigit()]
-    return tokens
+def slugify(value: str, fallback: str) -> str:
+    compact = value.strip().lower()
+    compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", compact)
+    compact = compact.strip("-")
+    if not compact:
+        compact = fallback
+    return compact[:72]
 
 
-def count_terms(tokens: Sequence[str], terms: Sequence[str] | set[str]) -> int:
-    term_set = set(terms)
-    return sum(1 for token in tokens if token in term_set)
+def safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
 
 
-def classify_question(text: str) -> str:
-    lowered = text.lower()
-    if any(marker in lowered for marker in ["write", "draft", "润色", "写", "改写", "总结"]):
-        return "creation"
-    if any(marker in lowered for marker in ["should", "choose", "选", "决策", "利弊", "tradeoff"]):
-        return "decision"
-    return "search"
+def format_iso(value: str | None) -> str:
+    if not value:
+        return "N/A"
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.isoformat()
 
 
-def iso_to_datetime(value: str) -> dt.datetime:
-    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+def make_workspace(output_dir: Path) -> None:
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    (output_dir / "topics").mkdir(parents=True, exist_ok=True)
+    (output_dir / "searches").mkdir(parents=True, exist_ok=True)
 
 
-@dataclass
-class TopicCorpus:
-    topic: Dict[str, Any]
-    messages: List[Dict[str, Any]]
+def collect_topics(client: CherryHistoryClient, args: argparse.Namespace) -> List[Dict[str, Any]]:
+    chosen: List[Dict[str, Any]] = []
+    seen_topic_ids = set()
 
+    if args.topic_ids:
+        for topic_id in args.topic_ids:
+            topic = client.get_topic(topic_id)
+            if topic["topicId"] in seen_topic_ids:
+                continue
+            seen_topic_ids.add(topic["topicId"])
+            chosen.append(topic)
 
-def collect_topic_corpora(client: CherryHistoryClient, args: argparse.Namespace) -> List[TopicCorpus]:
+    if chosen:
+        return chosen
+
     catalog = client.list_topics(limit=args.topic_limit, assistantId=args.assistant_id, keyword=args.keyword)
     topics = catalog.get("topics", [])
-    corpora: List[TopicCorpus] = []
     for topic in topics:
-        transcript = list(
-            client.iter_transcript(
-                topic["topicId"],
-                limitMessages=args.message_limit_per_page,
-                responseSelection="all",
-                order="asc",
-            )
+        if topic["topicId"] in seen_topic_ids:
+            continue
+        seen_topic_ids.add(topic["topicId"])
+        chosen.append(topic)
+    return chosen
+
+
+def collect_transcript(
+    client: CherryHistoryClient,
+    topic_id: str,
+    message_limit_per_page: int,
+    response_selection: str,
+    transcript_order: str,
+) -> List[Dict[str, Any]]:
+    return list(
+        client.iter_transcript(
+            topic_id,
+            limitMessages=message_limit_per_page,
+            responseSelection=response_selection,
+            order=transcript_order,
         )
-        corpora.append(TopicCorpus(topic=topic, messages=transcript))
-    return corpora
+    )
 
 
-def compute_tfidf(topics: Sequence[TopicCorpus]) -> List[Tuple[str, float]]:
-    doc_tokens: List[List[str]] = []
-    document_frequency: collections.Counter[str] = collections.Counter()
-    for corpus in topics:
-        tokens = tokenize(" ".join(message.get("mainText") or "" for message in corpus.messages))
-        doc_tokens.append(tokens)
-        for token in set(tokens):
-            document_frequency[token] += 1
+def render_catalog_markdown(topics: Sequence[Dict[str, Any]]) -> str:
+    lines = [
+        "# Topic Catalog",
+        "",
+        "Use this file to decide where to read next. It is an index, not an interpretation.",
+        "",
+    ]
+    if not topics:
+        lines.append("- No topics matched the current filters.")
+        return "\n".join(lines)
 
-    scores: collections.Counter[str] = collections.Counter()
-    doc_count = max(len(doc_tokens), 1)
-    for tokens in doc_tokens:
-        term_frequency = collections.Counter(tokens)
-        token_total = max(len(tokens), 1)
-        for token, count in term_frequency.items():
-            tf = count / token_total
-            idf = math.log((doc_count + 1) / (document_frequency[token] + 1)) + 1
-            scores[token] += tf * idf
-
-    return scores.most_common(20)
-
-
-def compute_cooccurrence(topics: Sequence[TopicCorpus]) -> List[Tuple[Tuple[str, str], int]]:
-    edge_weights: collections.Counter[Tuple[str, str]] = collections.Counter()
-    for corpus in topics:
-        tokens = tokenize(" ".join(message.get("mainText") or "" for message in corpus.messages))
-        unique_tokens = list(dict.fromkeys(tokens[:40]))
-        for index, left in enumerate(unique_tokens):
-            for right in unique_tokens[index + 1 :]:
-                pair = tuple(sorted((left, right)))
-                edge_weights[pair] += 1
-    return edge_weights.most_common(10)
+    for index, topic in enumerate(topics, start=1):
+        lines.extend(
+            [
+                f"## {index}. {topic.get('topicName') or topic['topicId']}",
+                f"- topicId: `{topic['topicId']}`",
+                f"- assistant: {topic.get('assistantName') or 'N/A'}",
+                f"- createdAt: {format_iso(topic.get('createdAt'))}",
+                f"- lastMessageAt: {format_iso(topic.get('lastMessageAt'))}",
+                f"- messageCount: {topic.get('messageCount', 'N/A')}",
+                f"- roundCount: {topic.get('roundCount', 'N/A')}",
+                f"- segmentCount: {topic.get('segmentCount', 'N/A')}",
+                f"- preview: {safe_text(topic.get('preview')) or 'N/A'}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
 
 
-def describe_behavior(topics: Sequence[TopicCorpus]) -> Dict[str, Any]:
-    clear_count = 0
-    user_messages = 0
-    assistant_messages = 0
-    active_hours: collections.Counter[int] = collections.Counter()
-    question_types: collections.Counter[str] = collections.Counter()
-    segment_ids = set()
-    round_ids = set()
-    round_gaps: List[float] = []
+def render_message_markdown(message: Dict[str, Any], index: int) -> str:
+    annotations = message.get("annotations") or {}
+    lines = [
+        f"### {index}. {message.get('role', 'unknown')} | {format_iso(message.get('createdAt'))}",
+        f"- messageId: `{message.get('messageId', 'N/A')}`",
+    ]
+    if message.get("type"):
+        lines.append(f"- type: `{message['type']}`")
+    if annotations.get("segmentId"):
+        lines.append(f"- segmentId: `{annotations['segmentId']}`")
+    if annotations.get("roundId"):
+        lines.append(f"- roundId: `{annotations['roundId']}`")
+    if message.get("askId"):
+        lines.append(f"- askId: `{message['askId']}`")
+    if message.get("modelId"):
+        lines.append(f"- modelId: `{message['modelId']}`")
+    if annotations.get("isPreferredResponse") is True:
+        lines.append("- preferredResponse: true")
+    lines.append("")
 
-    for corpus in topics:
-        clear_count += max(int(corpus.topic.get("segmentCount", 0)) - 1, 0)
-        user_timestamps: List[dt.datetime] = []
+    main_text = safe_text(message.get("mainText"))
+    if main_text:
+        lines.extend(["#### Main Text", "", main_text, ""])
 
-        for message in corpus.messages:
-            annotations = message.get("annotations", {})
-            if annotations.get("segmentId"):
-                segment_ids.add((corpus.topic["topicId"], annotations["segmentId"]))
-            if annotations.get("roundId"):
-                round_ids.add((corpus.topic["topicId"], annotations["roundId"]))
+    thinking_text = safe_text(message.get("thinkingText"))
+    if thinking_text:
+        lines.extend(["#### Thinking Text", "", thinking_text, ""])
 
-            timestamp = iso_to_datetime(message["createdAt"])
-            active_hours[timestamp.hour] += 1
+    tool_calls = message.get("toolCalls") or []
+    if tool_calls:
+        lines.extend(["#### Tool Calls", ""])
+        for tool_index, tool_call in enumerate(tool_calls, start=1):
+            lines.append(f"- Tool {tool_index}: {tool_call.get('toolName') or 'Unknown'}")
+            arguments = safe_text(tool_call.get("arguments"))
+            result = safe_text(tool_call.get("result"))
+            if arguments:
+                lines.append("  - arguments:")
+                lines.append("")
+                lines.append("    ```json")
+                for line in arguments.splitlines() or [""]:
+                    lines.append(f"    {line}")
+                lines.append("    ```")
+            if result:
+                lines.append("  - result:")
+                lines.append("")
+                lines.append("    ```text")
+                for line in result.splitlines() or [""]:
+                    lines.append(f"    {line}")
+                lines.append("    ```")
+        lines.append("")
 
-            if message["role"] == "user":
-                user_messages += 1
-                user_timestamps.append(timestamp)
-                question_types[classify_question(message.get("mainText") or "")] += 1
-            else:
-                assistant_messages += 1
+    if not main_text and not thinking_text and not tool_calls:
+        lines.extend(["#### Content", "", "_No textual content extracted for this message._", ""])
 
-        for index in range(1, len(user_timestamps)):
-            gap_hours = (user_timestamps[index] - user_timestamps[index - 1]).total_seconds() / 3600
-            round_gaps.append(gap_hours)
-
-    return {
-        "topicCount": len(topics),
-        "segmentCount": len(segment_ids),
-        "roundCount": len(round_ids),
-        "userMessages": user_messages,
-        "assistantMessages": assistant_messages,
-        "activeHours": active_hours.most_common(5),
-        "questionTypes": question_types,
-        "avgRoundGapHours": (sum(round_gaps) / len(round_gaps)) if round_gaps else None,
-        "clearCount": clear_count,
-    }
-
-
-def describe_style(topics: Sequence[TopicCorpus]) -> Dict[str, Any]:
-    tokens = tokenize(" ".join(message.get("mainText") or "" for corpus in topics for message in corpus.messages))
-    return {
-        "hedgeCount": count_terms(tokens, HEDGE_TERMS),
-        "certaintyCount": count_terms(tokens, CERTAINTY_TERMS),
-        "causalCount": count_terms(tokens, CAUSAL_TERMS),
-        "planningCount": count_terms(tokens, PLANNING_TERMS),
-        "comparisonCount": count_terms(tokens, COMPARISON_TERMS),
-        "tokenCount": len(tokens),
-        "uniqueTokenCount": len(set(tokens)),
-    }
+    return "\n".join(lines)
 
 
-def describe_emotion_and_values(topics: Sequence[TopicCorpus]) -> Dict[str, Dict[str, int]]:
-    tokens = tokenize(" ".join(message.get("mainText") or "" for corpus in topics for message in corpus.messages))
-    emotions = {label: count_terms(tokens, terms) for label, terms in EMOTION_TERMS.items()}
-    values = {label: count_terms(tokens, terms) for label, terms in VALUE_TERMS.items()}
-    return {"emotions": emotions, "values": values}
-
-
-def build_interest_timeline(topics: Sequence[TopicCorpus]) -> List[Tuple[str, List[str]]]:
-    window_scores: Dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
-    for corpus in topics:
-        for message in corpus.messages:
-            if message["role"] != "user":
-                continue
-            window = message["createdAt"][:10]
-            for token in tokenize(message.get("mainText") or ""):
-                window_scores[window][token] += 1
-    return [(window, [token for token, _ in scores.most_common(5)]) for window, scores in sorted(window_scores.items())]
-
-
-def render_report(topics: Sequence[TopicCorpus]) -> str:
-    behavior = describe_behavior(topics)
-    style = describe_style(topics)
-    emotion_values = describe_emotion_and_values(topics)
-    tfidf_terms = compute_tfidf(topics)
-    cooccurrence = compute_cooccurrence(topics)
-    timeline = build_interest_timeline(topics)
-
-    summary_lines = [
-        f"- Topics analyzed: {behavior['topicCount']}",
-        f"- Segments observed: {behavior['segmentCount']}",
-        f"- Rounds observed: {behavior['roundCount']}",
-        f"- User messages: {behavior['userMessages']}",
-        f"- Assistant messages: {behavior['assistantMessages']}",
+def render_topic_markdown(topic: Dict[str, Any], transcript: Sequence[Dict[str, Any]]) -> str:
+    lines = [
+        f"# {topic.get('topicName') or topic['topicId']}",
+        "",
+        "This file is raw research material exported from the local /v1/history API. Read it directly; do not assume it already contains conclusions.",
+        "",
+        f"- topicId: `{topic['topicId']}`",
+        f"- assistant: {topic.get('assistantName') or 'N/A'}",
+        f"- createdAt: {format_iso(topic.get('createdAt'))}",
+        f"- updatedAt: {format_iso(topic.get('updatedAt'))}",
+        f"- firstMessageAt: {format_iso(topic.get('firstMessageAt'))}",
+        f"- lastMessageAt: {format_iso(topic.get('lastMessageAt'))}",
+        f"- messageCount: {topic.get('messageCount', 'N/A')}",
+        f"- roundCount: {topic.get('roundCount', 'N/A')}",
+        f"- segmentCount: {topic.get('segmentCount', 'N/A')}",
+        "",
+        "## Transcript",
+        "",
     ]
 
-    summary_lines.append(f"- Clear boundaries inferred: {behavior['clearCount']}")
+    if not transcript:
+        lines.append("_No transcript messages were returned for this topic._")
+        return "\n".join(lines)
 
-    if behavior["avgRoundGapHours"] is not None:
-        summary_lines.append(f"- Average gap between user rounds: {behavior['avgRoundGapHours']:.1f} hours")
+    for index, message in enumerate(transcript, start=1):
+        lines.append(render_message_markdown(message, index))
 
-    question_mix = ", ".join(f"{name}={count}" for name, count in behavior["questionTypes"].most_common())
-    active_hours = ", ".join(f"{hour}:00 ({count})" for hour, count in behavior["activeHours"])
-    top_terms = ", ".join(f"{term} ({score:.2f})" for term, score in tfidf_terms[:10])
-    top_edges = ", ".join(f"{left}-{right} ({weight})" for (left, right), weight in cooccurrence[:8])
-    timeline_lines = "\n".join(f"- {window}: {', '.join(words)}" for window, words in timeline[:10]) or "- No timeline data"
+    return "\n".join(lines)
 
-    emotion_lines = "\n".join(
-        f"- {label}: {count}" for label, count in sorted(emotion_values["emotions"].items(), key=lambda item: item[1], reverse=True)
-    )
-    value_lines = "\n".join(
-        f"- {label}: {count}" for label, count in sorted(emotion_values["values"].items(), key=lambda item: item[1], reverse=True)
-    )
 
-    return f"""# Executive Summary
+def render_search_markdown(query: str, payload: Dict[str, Any]) -> str:
+    hits = payload.get("hits", [])
+    lines = [
+        f"# Search: {query}",
+        "",
+        "Use these hits as entry points. Search results are not conclusions.",
+        "",
+        f"- total: {payload.get('total', len(hits))}",
+        "",
+    ]
+    if not hits:
+        lines.append("- No hits were returned.")
+        return "\n".join(lines)
 
-{os.linesep.join(summary_lines)}
+    for index, hit in enumerate(hits, start=1):
+        annotations = hit.get("annotations") or {}
+        lines.extend(
+            [
+                f"## Hit {index}",
+                f"- topic: {hit.get('topicName') or hit.get('topicId')}",
+                f"- topicId: `{hit.get('topicId', 'N/A')}`",
+                f"- role: `{hit.get('role', 'N/A')}`",
+                f"- createdAt: {format_iso(hit.get('createdAt'))}",
+                f"- messageId: `{hit.get('messageId', 'N/A')}`",
+                f"- segmentId: `{annotations.get('segmentId', 'N/A')}`",
+                f"- roundId: `{annotations.get('roundId', 'N/A')}`",
+                "",
+                hit.get("snippet") or "_No snippet returned._",
+                "",
+            ]
+        )
 
-# Topic & Interest Evolution
+    return "\n".join(lines)
 
-- High-salience terms (TF-IDF style): {top_terms or 'N/A'}
-- Concept co-occurrence edges: {top_edges or 'N/A'}
-- Topic timeline:
-{timeline_lines}
 
-# Conversation Behavior
+def render_workspace_readme(
+    output_dir: Path,
+    topics: Sequence[Dict[str, Any]],
+    search_queries: Sequence[str],
+) -> str:
+    lines = [
+        "# Cherry Chat Research Workspace",
+        "",
+        "This workspace is raw material for deep chat-history research.",
+        "It does not contain precomputed themes, personality claims, or fixed conclusions.",
+        "",
+        "## Suggested Use",
+        "",
+        "1. Start with `catalog.md` to see the available topics.",
+        "2. Read the topic transcripts that feel recent, emotionally charged, or repeatedly relevant.",
+        "3. Use the `searches/` folder for motif tracing when you already suspect a theme.",
+        "4. Form hypotheses, look for counterexamples, and only then write the final report or HTML artifact.",
+        "",
+        "## Files",
+        "",
+        "- `manifest.json`: export metadata and file index",
+        "- `catalog.json`: raw topic catalog payload",
+        "- `catalog.md`: human-readable topic index",
+        "- `topics/*.json`: per-topic raw transcript bundles",
+        "- `topics/*.md`: per-topic readable transcripts",
+        "- `searches/*.json` and `searches/*.md`: optional search results",
+        "",
+        f"- outputDir: `{output_dir}`",
+        f"- topicsExported: {len(topics)}",
+        f"- searchesExported: {len(search_queries)}",
+    ]
+    return "\n".join(lines)
 
-- Question mix: {question_mix or 'N/A'}
-- Peak active hours: {active_hours or 'N/A'}
-- Preferred response behavior is inferred from `message.annotations.isPreferredResponse` where available.
 
-# Style & Cognitive Cues
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
-- Hedge language count: {style['hedgeCount']}
-- Certainty language count: {style['certaintyCount']}
-- Causal language count: {style['causalCount']}
-- Planning language count: {style['planningCount']}
-- Comparison / tradeoff language count: {style['comparisonCount']}
-- Token diversity: {style['uniqueTokenCount']} unique terms across {style['tokenCount']} tokens
 
-# Emotional / Value Signals
+def write_text(path: Path, value: str) -> None:
+    path.write_text(value, encoding="utf-8")
 
-Emotion cues:
-{emotion_lines}
 
-Value cues:
-{value_lines}
+def topic_payload(topic: Dict[str, Any], transcript: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "topic": topic,
+        "transcript": list(transcript),
+    }
 
-# Limits & Uncertainty
 
-- This report summarizes language patterns in the available Cherry Studio chat history only.
-- Tokenization is heuristic, especially for Chinese text, so topic and concept terms are approximate.
-- The report should be read as descriptive evidence about chat behavior, not as diagnosis or personality typing.
-- Missing topics, missing transcripts, or filtered segments can materially change the conclusions.
-"""
+def export_topics(
+    output_dir: Path,
+    topics: Sequence[Dict[str, Any]],
+    client: CherryHistoryClient,
+    args: argparse.Namespace,
+) -> List[Dict[str, Any]]:
+    topic_entries: List[Dict[str, Any]] = []
+    for topic in topics:
+        topic_meta = client.get_topic(topic["topicId"])
+        transcript = collect_transcript(
+            client,
+            topic_meta["topicId"],
+            message_limit_per_page=args.message_limit_per_page,
+            response_selection=args.response_selection,
+            transcript_order=args.transcript_order,
+        )
+        base_name = slugify(topic_meta.get("topicName") or topic_meta["topicId"], topic_meta["topicId"])
+        json_name = f"{base_name}__{topic_meta['topicId']}.json"
+        md_name = f"{base_name}__{topic_meta['topicId']}.md"
+        json_path = output_dir / "topics" / json_name
+        md_path = output_dir / "topics" / md_name
+        write_json(json_path, topic_payload(topic_meta, transcript))
+        write_text(md_path, render_topic_markdown(topic_meta, transcript))
+        topic_entries.append(
+            {
+                "topicId": topic_meta["topicId"],
+                "topicName": topic_meta.get("topicName") or topic_meta["topicId"],
+                "jsonFile": f"topics/{json_name}",
+                "markdownFile": f"topics/{md_name}",
+                "messageCount": len(transcript),
+            }
+        )
+    return topic_entries
+
+
+def export_searches(output_dir: Path, client: CherryHistoryClient, queries: Sequence[str]) -> List[Dict[str, Any]]:
+    search_entries: List[Dict[str, Any]] = []
+    for query in queries:
+        payload = client.search_messages(query, limit=50)
+        base_name = slugify(query, "search")
+        json_name = f"{base_name}.json"
+        md_name = f"{base_name}.md"
+        json_path = output_dir / "searches" / json_name
+        md_path = output_dir / "searches" / md_name
+        write_json(json_path, payload)
+        write_text(md_path, render_search_markdown(query, payload))
+        search_entries.append(
+            {
+                "query": query,
+                "jsonFile": f"searches/{json_name}",
+                "markdownFile": f"searches/{md_name}",
+                "hitCount": payload.get("total", len(payload.get("hits", []))),
+            }
+        )
+    return search_entries
+
+
+def build_manifest(
+    output_dir: Path,
+    args: argparse.Namespace,
+    topic_entries: Sequence[Dict[str, Any]],
+    search_entries: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "workspacePurpose": "Raw material for deep chat-history research. This workspace intentionally avoids precomputed interpretations.",
+        "outputDir": str(output_dir),
+        "filters": {
+            "topicLimit": args.topic_limit,
+            "assistantId": args.assistant_id,
+            "keyword": args.keyword,
+            "topicIds": args.topic_ids or [],
+            "searchQueries": args.search_queries or [],
+            "messageLimitPerPage": args.message_limit_per_page,
+            "responseSelection": args.response_selection,
+            "transcriptOrder": args.transcript_order,
+        },
+        "topics": list(topic_entries),
+        "searches": list(search_entries),
+    }
 
 
 def main() -> None:
     args = parse_args()
     client = CherryHistoryClient()
-    corpora = collect_topic_corpora(client, args)
-    report = render_report(corpora)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    make_workspace(output_dir)
 
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as output_file:
-            output_file.write(report)
-            if not report.endswith("\n"):
-                output_file.write("\n")
-    else:
-        print(report)
+    topics = collect_topics(client, args)
+    catalog_payload = {"topics": list(topics), "total": len(topics)}
+    write_json(output_dir / "catalog.json", catalog_payload)
+    write_text(output_dir / "catalog.md", render_catalog_markdown(topics))
+
+    topic_entries = export_topics(output_dir, topics, client, args)
+    search_entries = export_searches(output_dir, client, args.search_queries or [])
+
+    manifest = build_manifest(output_dir, args, topic_entries, search_entries)
+    write_json(output_dir / "manifest.json", manifest)
+    write_text(output_dir / "README.md", render_workspace_readme(output_dir, topics, args.search_queries or []))
+
+    print(str(output_dir))
 
 
 if __name__ == "__main__":
