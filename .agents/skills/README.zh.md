@@ -65,12 +65,12 @@ pnpm skills:check
 有些面向最终用户的 skill 会单独维护在独立仓库里。
 例如，`cherry-chat-research` 现在维护在：
 
-- `https://github.com/ifastcc/cherry-skills`
+- `https://github.com/ifastcc/cherry-chat-research`
 
 示例：
 
 ```bash
-npx skills add ifastcc/cherry-skills --skill cherry-chat-research -a codex -a claude-code
+npx skills add ifastcc/cherry-chat-research --skill cherry-chat-research -a codex -a claude-code
 npx skills check
 npx skills update
 ```

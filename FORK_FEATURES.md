@@ -82,7 +82,7 @@
 
 这个 skill 现在单独维护在：
 
-- `https://github.com/ifastcc/cherry-skills`
+- `https://github.com/ifastcc/cherry-chat-research`
 
 这个 skill 不是固定报表生成器。
 
@@ -98,7 +98,7 @@
 安装：
 
 ```bash
-npx skills add ifastcc/cherry-skills --skill cherry-chat-research -a codex -a claude-code
+npx skills add ifastcc/cherry-chat-research --skill cherry-chat-research -a codex -a claude-code
 ```
 
 使用前先做两步：

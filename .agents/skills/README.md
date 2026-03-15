@@ -65,12 +65,12 @@ Public skills in this repository can also be installed and managed with
 Some end-user skills may live in separate repositories.
 For example, `cherry-chat-research` is now maintained in:
 
-- `https://github.com/ifastcc/cherry-skills`
+- `https://github.com/ifastcc/cherry-chat-research`
 
 Example:
 
 ```bash
-npx skills add ifastcc/cherry-skills --skill cherry-chat-research -a codex -a claude-code
+npx skills add ifastcc/cherry-chat-research --skill cherry-chat-research -a codex -a claude-code
 npx skills check
 npx skills update
 ```
