@@ -291,6 +291,81 @@ router.get('/topics/:topicId/messages', async (req: Request, res: Response) => {
 
 /**
  * @swagger
+ * /v1/history/messages:
+ *   get:
+ *     summary: List messages across topics
+ *     description: Returns a paginated cross-topic message stream for a time window or filtered history scan.
+ *     tags: [History]
+ *     parameters:
+ *       - in: query
+ *         name: messageFrom
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *       - in: query
+ *         name: messageTo
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *       - in: query
+ *         name: assistantId
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: topicId
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: role
+ *         schema:
+ *           type: string
+ *           enum: [user, assistant]
+ *       - in: query
+ *         name: order
+ *         schema:
+ *           type: string
+ *           enum: [asc, desc]
+ *       - in: query
+ *         name: cursor
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *     responses:
+ *       200:
+ *         description: Cross-topic message stream
+ *       400:
+ *         description: Invalid query parameters
+ *       503:
+ *         description: Renderer is not ready
+ */
+router.get('/messages', async (req: Request, res: Response) => {
+  try {
+    const result = await historyService.listAllMessages({
+      messageRange: parseTimeRangeQuery(req, {
+        rangeKey: 'messageRange',
+        fromKey: 'messageFrom',
+        toKey: 'messageTo'
+      }),
+      assistantId: typeof req.query.assistantId === 'string' ? req.query.assistantId : undefined,
+      topicId: typeof req.query.topicId === 'string' ? req.query.topicId : undefined,
+      role: parseEnumQuery(req.query.role, 'role', ['user', 'assistant']),
+      order: parseEnumQuery(req.query.order, 'order', ['asc', 'desc']),
+      cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
+      limit: parseIntegerQuery(req.query.limit, 'limit', { min: 1 })
+    })
+
+    return res.json(result)
+  } catch (error) {
+    return handleHistoryError(error, res)
+  }
+})
+
+/**
+ * @swagger
  * /v1/history/topics/{topicId}/transcript:
  *   get:
  *     summary: Get topic transcript
@@ -347,6 +422,91 @@ router.get('/topics/:topicId/transcript', async (req: Request, res: Response) =>
       order: parseEnumQuery(req.query.order, 'order', ['asc', 'desc']),
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
       limitMessages: parseIntegerQuery(req.query.limitMessages, 'limitMessages', { min: 1 })
+    })
+
+    return res.json(result)
+  } catch (error) {
+    return handleHistoryError(error, res)
+  }
+})
+
+/**
+ * @swagger
+ * /v1/history/messages/batch:
+ *   post:
+ *     summary: Batch get messages
+ *     description: Returns full message records for a list of message ids while preserving input order.
+ *     tags: [History]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [messageIds]
+ *             properties:
+ *               messageIds:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *     responses:
+ *       200:
+ *         description: Batch message records
+ *       400:
+ *         description: Invalid request body
+ */
+router.post('/messages/batch', async (req: Request, res: Response) => {
+  try {
+    const messageIds = req.body?.messageIds
+    if (
+      !Array.isArray(messageIds) ||
+      messageIds.length === 0 ||
+      messageIds.some((value) => typeof value !== 'string' || !value.trim())
+    ) {
+      throw new TopicDataBadRequestError('messageIds must be a non-empty string array')
+    }
+
+    const result = await historyService.batchGetMessages(messageIds)
+    return res.json(result)
+  } catch (error) {
+    return handleHistoryError(error, res)
+  }
+})
+
+/**
+ * @swagger
+ * /v1/history/messages/{messageId}/context:
+ *   get:
+ *     summary: Get message context window
+ *     description: Returns the anchor message plus surrounding conversation messages from the same topic.
+ *     tags: [History]
+ *     parameters:
+ *       - in: path
+ *         name: messageId
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: before
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *       - in: query
+ *         name: after
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *     responses:
+ *       200:
+ *         description: Message context window
+ *       404:
+ *         description: Message not found
+ */
+router.get('/messages/:messageId/context', async (req: Request, res: Response) => {
+  try {
+    const result = await historyService.getMessageContext(req.params.messageId, {
+      before: parseIntegerQuery(req.query.before, 'before', { min: 0 }),
+      after: parseIntegerQuery(req.query.after, 'after', { min: 0 })
     })
 
     return res.json(result)

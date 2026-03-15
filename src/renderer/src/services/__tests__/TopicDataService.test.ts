@@ -292,6 +292,7 @@ describe('TopicDataService', () => {
     expect(result.hits[0]).toMatchObject({
       messageId: 'a3',
       topicId: topic.id,
+      mainText: 'Final follow-up reply',
       annotations: {
         segmentId: 'after:clear-1',
         segmentIndex: 1,
@@ -300,5 +301,55 @@ describe('TopicDataService', () => {
         isPreferredResponse: true
       }
     })
+  })
+
+  it('returns a context window around an anchor message', async () => {
+    const result = await topicDataService.getMessageContext('u2', {
+      before: 1,
+      after: 1
+    })
+
+    expect(result).toMatchObject({
+      anchorMessageId: 'u2',
+      topicId: topic.id,
+      topicName: topic.name
+    })
+    expect(result.messages.map((message) => message.messageId)).toEqual(['a-orphan', 'u2', 'a3'])
+  })
+
+  it('returns batch message details in input order and reports missing ids', async () => {
+    const result = await topicDataService.batchGetMessages(['a3', 'missing-id', 'u1'])
+
+    expect(result.messages.map((message) => message.messageId)).toEqual(['a3', 'u1'])
+    expect(result.missingMessageIds).toEqual(['missing-id'])
+  })
+
+  it('lists cross-topic messages with main text and cursor pagination', async () => {
+    const firstPage = await topicDataService.listAllMessages({
+      order: 'desc',
+      limit: 2
+    })
+
+    expect(firstPage.messages.map((message) => message.messageId)).toEqual(['a3', 'u2'])
+    expect(firstPage.messages[0]).toMatchObject({
+      topicId: topic.id,
+      topicName: topic.name,
+      assistantName: 'Architect',
+      mainText: 'Final follow-up reply'
+    })
+    expect(firstPage.pageInfo).toEqual({
+      hasMore: true,
+      nextCursor: 'u2',
+      returnedMessages: 2,
+      totalMessages: 6
+    })
+
+    const secondPage = await topicDataService.listAllMessages({
+      order: 'desc',
+      cursor: firstPage.pageInfo.nextCursor,
+      limit: 10
+    })
+
+    expect(secondPage.messages.map((message) => message.messageId)).toEqual(['a-orphan', 'a2', 'a1', 'u1'])
   })
 })

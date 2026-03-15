@@ -52,6 +52,25 @@ describe('TopicDataBridgeService', () => {
     await expect(topicDataBridgeService.getTopicMeta('topic-404')).rejects.toBeInstanceOf(TopicDataNotFoundError)
   })
 
+  it('passes batch message lookups through executeJavaScript', async () => {
+    executeJavaScript.mockResolvedValue({
+      ok: true,
+      data: {
+        messages: [],
+        missingMessageIds: ['missing-1']
+      }
+    })
+
+    const result = await topicDataBridgeService.batchGetMessages(['m1', 'missing-1'])
+
+    expect(result).toEqual({
+      messages: [],
+      missingMessageIds: ['missing-1']
+    })
+    expect(executeJavaScript.mock.calls[0][0]).toContain('"batchGetMessages"')
+    expect(executeJavaScript.mock.calls[0][0]).toContain('["m1","missing-1"]')
+  })
+
   it('returns TopicDataUnavailableError when renderer window is missing', async () => {
     getMainWindow.mockReturnValue(null)
 

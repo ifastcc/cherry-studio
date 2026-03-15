@@ -5,6 +5,11 @@ import {
   TopicDataUnavailableError
 } from '@main/services/TopicDataBridgeService'
 import type {
+  HistoryMessageListOptions,
+  HistoryMessageListResult,
+  MessageBatchResult,
+  MessageContextOptions,
+  MessageContextResult,
   MessageListOptions,
   MessageListResult,
   MessageRecord,
@@ -30,8 +35,20 @@ class HistoryService {
     return topicDataBridgeService.listMessages(topicId, options)
   }
 
+  async listAllMessages(options?: HistoryMessageListOptions): Promise<HistoryMessageListResult> {
+    return topicDataBridgeService.listAllMessages(options)
+  }
+
   async getMessage(messageId: string): Promise<MessageRecord> {
     return topicDataBridgeService.getMessage(messageId)
+  }
+
+  async getMessageContext(messageId: string, options?: MessageContextOptions): Promise<MessageContextResult> {
+    return topicDataBridgeService.getMessageContext(messageId, options)
+  }
+
+  async batchGetMessages(messageIds: string[]): Promise<MessageBatchResult> {
+    return topicDataBridgeService.batchGetMessages(messageIds)
   }
 
   async getTranscript(topicId: string, options?: TranscriptOptions): Promise<TranscriptResult> {

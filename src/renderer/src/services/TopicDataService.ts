@@ -19,7 +19,13 @@ import {
   type ToolMessageBlock
 } from '@renderer/types/newMessage'
 import type {
+  HistoryMessageListOptions,
+  HistoryMessageListResult,
+  HistoryMessageRecord,
   MessageAnnotations,
+  MessageBatchResult,
+  MessageContextOptions,
+  MessageContextResult,
   MessageListOptions,
   MessageListResult,
   MessagePreviewRecord,
@@ -74,6 +80,12 @@ interface TopicSummaryContext {
   firstMessageAt?: string
   lastMessageAt?: string
   preview: string
+}
+
+interface TopicMessageRef {
+  meta: TopicMeta
+  message: Message
+  annotations: Map<string, MessageAnnotations>
 }
 
 class TopicDataService {
@@ -187,32 +199,98 @@ class TopicDataService {
     }
   }
 
-  async getMessage(messageId: string): Promise<MessageRecord> {
-    const metas = this.getAllTopicMeta()
+  async listAllMessages(options?: HistoryMessageListOptions): Promise<HistoryMessageListResult> {
+    const order = options?.order ?? 'desc'
+    const limit = options?.limit ?? 100
+    const refs = await this.collectConversationMessageRefs(options)
 
-    for (const meta of metas) {
-      const topicData = await db.topics.get(meta.topic.id)
-      if (!topicData?.messages?.length) {
-        continue
+    refs.sort((left, right) => {
+      const delta = new Date(left.message.createdAt).getTime() - new Date(right.message.createdAt).getTime()
+      return order === 'asc' ? delta : -delta
+    })
+
+    let startIndex = 0
+    if (options?.cursor) {
+      const cursorIndex = refs.findIndex((ref) => ref.message.id === options.cursor)
+      if (cursorIndex === -1) {
+        throw new Error(`BAD_REQUEST: cursor not found in history message view: ${options.cursor}`)
       }
-
-      const message = topicData.messages.find(
-        (candidate) =>
-          candidate.id === messageId &&
-          candidate.type !== 'clear' &&
-          (candidate.role === 'user' || candidate.role === 'assistant')
-      )
-
-      if (!message) {
-        continue
-      }
-
-      const annotations = this.buildMessageAnnotations(topicData.messages)
-      const blocksMap = await this.loadBlocksMap(message.blocks || [])
-      return this.toMessageRecord(meta.topic.id, message, blocksMap, annotations)
+      startIndex = cursorIndex + 1
     }
 
-    throw new Error(`NOT_FOUND: Message not found: ${messageId}`)
+    const totalMessages = refs.length
+    const sliced = startIndex > 0 ? refs.slice(startIndex) : refs
+    const hasMore = sliced.length > limit
+    const page = sliced.slice(0, limit)
+    const nextCursor = hasMore ? page[page.length - 1]?.message.id : undefined
+    const blocksMap = await this.loadBlocksMap(page.flatMap((ref) => ref.message.blocks || []))
+    const messages = page.map((ref) => this.toHistoryMessageRecord(ref.meta, ref.message, blocksMap, ref.annotations))
+
+    return {
+      messages,
+      pageInfo: {
+        hasMore,
+        nextCursor,
+        returnedMessages: messages.length,
+        totalMessages
+      }
+    }
+  }
+
+  async getMessage(messageId: string): Promise<MessageRecord> {
+    const ref = await this.findMessageRef(messageId)
+    const blocksMap = await this.loadBlocksMap(ref.message.blocks || [])
+    return this.toMessageRecord(ref.meta.topic.id, ref.message, blocksMap, ref.annotations)
+  }
+
+  async getMessageContext(messageId: string, options?: MessageContextOptions): Promise<MessageContextResult> {
+    const ref = await this.findMessageRef(messageId)
+    const before = options?.before ?? 3
+    const after = options?.after ?? 3
+    const { messages } = await this.getTopicConversationContext(ref.meta.topic.id)
+    const anchorIndex = messages.findIndex((message) => message.id === messageId)
+
+    if (anchorIndex === -1) {
+      throw new Error(`NOT_FOUND: Message not found in conversation view: ${messageId}`)
+    }
+
+    const start = Math.max(0, anchorIndex - before)
+    const end = Math.min(messages.length, anchorIndex + after + 1)
+    const page = messages.slice(start, end)
+    const blocksMap = await this.loadBlocksMap(page.flatMap((message) => message.blocks || []))
+    const records = page.map((message) => this.toMessageRecord(ref.meta.topic.id, message, blocksMap, ref.annotations))
+
+    return {
+      anchorMessageId: messageId,
+      topicId: ref.meta.topic.id,
+      topicName: ref.meta.topic.name,
+      messages: records
+    }
+  }
+
+  async batchGetMessages(messageIds: string[]): Promise<MessageBatchResult> {
+    if (!messageIds.length) {
+      return {
+        messages: [],
+        missingMessageIds: []
+      }
+    }
+
+    const refs = await this.findMessageRefs(messageIds)
+    const refById = new Map(refs.map((ref) => [ref.message.id, ref]))
+    const orderedRefs = messageIds
+      .map((messageId) => refById.get(messageId))
+      .filter((ref): ref is TopicMessageRef => Boolean(ref))
+    const blocksMap = await this.loadBlocksMap(orderedRefs.flatMap((ref) => ref.message.blocks || []))
+    const messages = orderedRefs.map((ref) =>
+      this.toMessageRecord(ref.meta.topic.id, ref.message, blocksMap, ref.annotations)
+    )
+    const foundIds = new Set(refById.keys())
+
+    return {
+      messages,
+      missingMessageIds: messageIds.filter((messageId) => !foundIds.has(messageId))
+    }
   }
 
   async getTranscript(topicId: string, options?: TranscriptOptions): Promise<TranscriptResult> {
@@ -351,6 +429,7 @@ class TopicDataService {
           messageId: message.id,
           role: message.role as 'user' | 'assistant',
           snippet,
+          mainText,
           createdAt: message.createdAt,
           annotations: this.mustGetAnnotations(annotations, message.id)
         })
@@ -382,6 +461,107 @@ class TopicDataService {
       annotations,
       rounds: this.flattenRounds(topicData.messages || [])
     }
+  }
+
+  private async collectConversationMessageRefs(options?: {
+    assistantId?: string
+    topicId?: string
+    role?: 'user' | 'assistant'
+    messageRange?: TimeRange
+  }): Promise<TopicMessageRef[]> {
+    const metas = this.getAllTopicMeta().filter((meta) => {
+      if (options?.assistantId && meta.assistantId !== options.assistantId) {
+        return false
+      }
+
+      if (options?.topicId && meta.topic.id !== options.topicId) {
+        return false
+      }
+
+      return true
+    })
+
+    const refs: TopicMessageRef[] = []
+
+    for (const meta of metas) {
+      const topicData = await db.topics.get(meta.topic.id)
+      if (!topicData?.messages?.length) {
+        continue
+      }
+
+      const annotations = this.buildMessageAnnotations(topicData.messages)
+      const conversationMessages = this.getConversationMessages(topicData.messages)
+
+      for (const message of conversationMessages) {
+        if (options?.role && message.role !== options.role) {
+          continue
+        }
+
+        if (options?.messageRange && !this.inTimeRange(message.createdAt, options.messageRange)) {
+          continue
+        }
+
+        refs.push({
+          meta,
+          message,
+          annotations
+        })
+      }
+    }
+
+    return refs
+  }
+
+  private async findMessageRef(messageId: string): Promise<TopicMessageRef> {
+    const refs = await this.findMessageRefs([messageId])
+    const ref = refs[0]
+    if (!ref) {
+      throw new Error(`NOT_FOUND: Message not found: ${messageId}`)
+    }
+    return ref
+  }
+
+  private async findMessageRefs(messageIds: string[]): Promise<TopicMessageRef[]> {
+    const orderedUniqueIds = [...new Set(messageIds)]
+    const pending = new Set(orderedUniqueIds)
+    const refsById = new Map<string, TopicMessageRef>()
+    const metas = this.getAllTopicMeta()
+
+    for (const meta of metas) {
+      if (!pending.size) {
+        break
+      }
+
+      const topicData = await db.topics.get(meta.topic.id)
+      if (!topicData?.messages?.length) {
+        continue
+      }
+
+      const foundMessages = topicData.messages.filter(
+        (message) =>
+          pending.has(message.id) &&
+          message.type !== 'clear' &&
+          (message.role === 'user' || message.role === 'assistant')
+      )
+
+      if (!foundMessages.length) {
+        continue
+      }
+
+      const annotations = this.buildMessageAnnotations(topicData.messages)
+      for (const message of foundMessages) {
+        refsById.set(message.id, {
+          meta,
+          message,
+          annotations
+        })
+        pending.delete(message.id)
+      }
+    }
+
+    return orderedUniqueIds
+      .map((messageId) => refsById.get(messageId))
+      .filter((ref): ref is TopicMessageRef => Boolean(ref))
   }
 
   private async buildTopicSummaryContext(meta: TopicMeta, messages: Message[]): Promise<TopicSummaryContext> {
@@ -488,6 +668,19 @@ class TopicDataService {
       thinkingText: thinkingBlocks.length ? thinkingBlocks.map((block) => block.content).join('\n') : undefined,
       toolCalls: this.toToolCalls(toolBlocks),
       annotations: this.mustGetAnnotations(annotations, message.id)
+    }
+  }
+
+  private toHistoryMessageRecord(
+    meta: TopicMeta,
+    message: Message,
+    blocksMap: Map<string, MessageBlock>,
+    annotations: Map<string, MessageAnnotations>
+  ): HistoryMessageRecord {
+    return {
+      ...this.toMessageRecord(meta.topic.id, message, blocksMap, annotations),
+      topicName: meta.topic.name,
+      assistantName: meta.assistantName
     }
   }
 
@@ -754,7 +947,10 @@ export const windowTopicDataService: WindowTopicDataService = {
   listTopics: (filter) => topicDataService.listTopics(filter),
   getTopicMeta: (topicId) => topicDataService.getTopicMeta(topicId),
   listMessages: (topicId, options) => topicDataService.listMessages(topicId, options),
+  listAllMessages: (options) => topicDataService.listAllMessages(options),
   getMessage: (messageId) => topicDataService.getMessage(messageId),
+  getMessageContext: (messageId, options) => topicDataService.getMessageContext(messageId, options),
+  batchGetMessages: (messageIds) => topicDataService.batchGetMessages(messageIds),
   getTranscript: (topicId, options) => topicDataService.getTranscript(topicId, options),
   searchMessages: (query, options) => topicDataService.searchMessages(query, options)
 }
@@ -765,7 +961,13 @@ if (typeof window !== 'undefined') {
 
 export { TopicDataService }
 export type {
+  HistoryMessageListOptions,
+  HistoryMessageListResult,
+  HistoryMessageRecord,
   MessageAnnotations,
+  MessageBatchResult,
+  MessageContextOptions,
+  MessageContextResult,
   MessageListOptions,
   MessageListResult,
   MessagePreviewRecord,

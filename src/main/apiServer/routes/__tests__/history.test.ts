@@ -14,8 +14,11 @@ const { historyService, TopicDataBadRequestError, TopicDataNotFoundError, TopicD
         listTopics: vi.fn(),
         getTopicMeta: vi.fn(),
         listMessages: vi.fn(),
+        listAllMessages: vi.fn(),
         getTranscript: vi.fn(),
         getMessage: vi.fn(),
+        getMessageContext: vi.fn(),
+        batchGetMessages: vi.fn(),
         searchMessages: vi.fn()
       },
       TopicDataBadRequestError: HoistedTopicDataBadRequestError,
@@ -87,5 +90,49 @@ describe('historyRoutes', () => {
 
     const payload = await response.json()
     expect(payload.error.code).toBe('renderer_unavailable')
+  })
+
+  it('parses cross-topic message timeline queries', async () => {
+    historyService.listAllMessages.mockResolvedValue({
+      messages: [],
+      pageInfo: {
+        hasMore: false,
+        returnedMessages: 0,
+        totalMessages: 0
+      }
+    })
+
+    const response = await fetch(
+      `${baseUrl}/v1/history/messages?messageFrom=2026-03-10T00:00:00.000Z&order=asc&limit=10`
+    )
+
+    expect(response.status).toBe(200)
+    expect(historyService.listAllMessages).toHaveBeenCalledWith({
+      messageRange: {
+        from: '2026-03-10T00:00:00.000Z',
+        to: undefined
+      },
+      assistantId: undefined,
+      topicId: undefined,
+      role: undefined,
+      order: 'asc',
+      cursor: undefined,
+      limit: 10
+    })
+  })
+
+  it('returns 400 for invalid batch message requests', async () => {
+    const response = await fetch(`${baseUrl}/v1/history/messages/batch`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ messageIds: ['ok', ''] })
+    })
+
+    expect(response.status).toBe(400)
+
+    const payload = await response.json()
+    expect(payload.error.code).toBe('invalid_parameters')
   })
 })

@@ -66,6 +66,11 @@ export interface MessageRecord {
   annotations: MessageAnnotations
 }
 
+export interface HistoryMessageRecord extends MessageRecord {
+  topicName: string
+  assistantName: string
+}
+
 export interface MessagePreviewRecord {
   messageId: string
   topicId: string
@@ -87,6 +92,21 @@ export interface MessageListResult {
   topicId: string
   messages: MessagePreviewRecord[]
   total: number
+}
+
+export interface HistoryMessageListOptions {
+  messageRange?: TimeRange
+  assistantId?: string
+  topicId?: string
+  role?: 'user' | 'assistant'
+  order?: 'asc' | 'desc'
+  cursor?: string
+  limit?: number
+}
+
+export interface HistoryMessageListResult {
+  messages: HistoryMessageRecord[]
+  pageInfo: PageInfo
 }
 
 export interface TranscriptOptions {
@@ -112,6 +132,23 @@ export interface TranscriptResult {
   pageInfo: PageInfo
 }
 
+export interface MessageContextOptions {
+  before?: number
+  after?: number
+}
+
+export interface MessageContextResult {
+  anchorMessageId: string
+  topicId: string
+  topicName: string
+  messages: MessageRecord[]
+}
+
+export interface MessageBatchResult {
+  messages: MessageRecord[]
+  missingMessageIds: string[]
+}
+
 export interface SearchMessagesOptions {
   messageRange?: TimeRange
   assistantId?: string
@@ -128,6 +165,7 @@ export interface MessageHit {
   messageId: string
   role: 'user' | 'assistant'
   snippet: string
+  mainText: string
   createdAt: string
   annotations: MessageAnnotations
 }
@@ -142,7 +180,10 @@ export interface WindowTopicDataService {
   listTopics: (filter?: TopicListFilter) => Promise<TopicListResult>
   getTopicMeta: (topicId: string) => Promise<TopicMetaResult>
   listMessages: (topicId: string, options?: MessageListOptions) => Promise<MessageListResult>
+  listAllMessages: (options?: HistoryMessageListOptions) => Promise<HistoryMessageListResult>
   getMessage: (messageId: string) => Promise<MessageRecord>
+  getMessageContext: (messageId: string, options?: MessageContextOptions) => Promise<MessageContextResult>
+  batchGetMessages: (messageIds: string[]) => Promise<MessageBatchResult>
   getTranscript: (topicId: string, options?: TranscriptOptions) => Promise<TranscriptResult>
   searchMessages: (query: string, options?: SearchMessagesOptions) => Promise<SearchMessagesResult>
 }

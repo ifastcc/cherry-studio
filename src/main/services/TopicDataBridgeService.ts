@@ -1,4 +1,9 @@
 import type {
+  HistoryMessageListOptions,
+  HistoryMessageListResult,
+  MessageBatchResult,
+  MessageContextOptions,
+  MessageContextResult,
   MessageListOptions,
   MessageListResult,
   MessageRecord,
@@ -37,8 +42,20 @@ class TopicDataBridgeService {
     return this.invoke('listMessages', topicId, options)
   }
 
+  async listAllMessages(options?: HistoryMessageListOptions): Promise<HistoryMessageListResult> {
+    return this.invoke('listAllMessages', options)
+  }
+
   async getMessage(messageId: string): Promise<MessageRecord> {
     return this.invoke('getMessage', messageId)
+  }
+
+  async getMessageContext(messageId: string, options?: MessageContextOptions): Promise<MessageContextResult> {
+    return this.invoke('getMessageContext', messageId, options)
+  }
+
+  async batchGetMessages(messageIds: string[]): Promise<MessageBatchResult> {
+    return this.invoke('batchGetMessages', messageIds)
   }
 
   async getTranscript(topicId: string, options?: TranscriptOptions): Promise<TranscriptResult> {
