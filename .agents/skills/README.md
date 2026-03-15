@@ -24,9 +24,11 @@ For each new public skill, run:
 pnpm skills:sync
 ```
 
-`skills:sync` will create/update `.claude/skills/<skill-name>/SKILL.md` as:
+`skills:sync` will create/update `.claude/skills/<skill-name>/` as a mirror of the public skill directory:
 
-- a copied file from `.agents/skills/<skill-name>/SKILL.md`.
+- `SKILL.md` is copied from `.agents/skills/<skill-name>/SKILL.md`.
+- repo-local files such as `scripts/` or `assets/` are mirrored too.
+- generated artifacts like `__pycache__/`, `*.pyc`, and `.DS_Store` stay ignored.
 - symlinks are not allowed; check enforces regular files for compatibility.
 
 ## White-list Tracking Rules
@@ -53,4 +55,23 @@ The sync/check scripts manage and verify:
 
 - `.agents/skills/.gitignore`
 - `.claude/skills/.gitignore`
-- `.claude/skills/<skill-name>/SKILL.md` content matches `.agents/skills/<skill-name>/SKILL.md`
+- `.claude/skills/<skill-name>/` content matches `.agents/skills/<skill-name>/`
+
+## GitHub Distribution
+
+Public skills in this repository can also be installed and managed with
+[`vercel-labs/skills`](https://github.com/vercel-labs/skills).
+
+Example:
+
+```bash
+npx skills add ifastcc/cherry-studio --skill cherry-chat-research -a codex -a claude-code
+npx skills check
+npx skills update
+```
+
+Use repository-native workflows for authoring and review:
+
+- edit under `.agents/skills`
+- keep `public-skills.txt` as the whitelist
+- run `pnpm skills:sync` and `pnpm skills:check`

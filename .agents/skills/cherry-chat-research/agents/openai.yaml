@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cherry Chat Research"
+  short_description: "Analyze Cherry Studio chat history through the local history API"
+  default_prompt: "Study my Cherry Studio chat history and produce a descriptive research report."

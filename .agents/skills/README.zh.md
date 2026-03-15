@@ -24,9 +24,11 @@
 pnpm skills:sync
 ```
 
-`skills:sync` 会自动创建/更新 `.claude/skills/<skill-name>/SKILL.md`：
+`skills:sync` 会自动创建/更新 `.claude/skills/<skill-name>/`，作为公共 skill 目录的镜像：
 
-- 复制 `.agents/skills/<skill-name>/SKILL.md` 的内容。
+- `SKILL.md` 会从 `.agents/skills/<skill-name>/SKILL.md` 复制过去。
+- `scripts/`、`assets/` 这类仓库内辅助文件也会一起镜像。
+- `__pycache__/`、`*.pyc`、`.DS_Store` 这类派生文件会继续被忽略。
 - 不允许使用符号链接；check 会强制要求为普通文件以保证兼容性。
 
 ## 白名单跟踪规则
@@ -53,4 +55,23 @@ pnpm skills:check
 
 - `.agents/skills/.gitignore`
 - `.claude/skills/.gitignore`
-- `.claude/skills/<skill-name>/SKILL.md` 与 `.agents/skills/<skill-name>/SKILL.md` 的内容一致性
+- `.claude/skills/<skill-name>/` 与 `.agents/skills/<skill-name>/` 的内容一致性
+
+## GitHub 分发
+
+仓库里的公共 skill 也可以通过
+[`vercel-labs/skills`](https://github.com/vercel-labs/skills) 进行安装和更新管理。
+
+示例：
+
+```bash
+npx skills add ifastcc/cherry-studio --skill cherry-chat-research -a codex -a claude-code
+npx skills check
+npx skills update
+```
+
+仓库内仍然保持现有的维护方式：
+
+- 所有源码都在 `.agents/skills`
+- `public-skills.txt` 仍然是公共白名单
+- 每次改动后运行 `pnpm skills:sync` 和 `pnpm skills:check`
