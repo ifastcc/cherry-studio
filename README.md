@@ -65,7 +65,7 @@
 
 Cherry Studio is a desktop client that supports multiple LLM providers, available on Windows, Mac and Linux.
 
-> Fork note: this fork adds topic sync, external history/MCP surfaces, and a chat-history research skill. See [FORK_FEATURES.md](FORK_FEATURES.md).
+> Fork note: for the extra sync, API, and skill workflow in this fork, start with [FORK_FEATURES.md](FORK_FEATURES.md).
 
 👏 Join [Telegram Group](https://t.me/CherryStudioAI)｜[Discord](https://discord.gg/wez8HtpxqQ) | [QQ Group(575014769)](https://qm.qq.com/q/lo0D4qVZKi)
 
