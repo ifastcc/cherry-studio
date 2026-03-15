@@ -60,7 +60,7 @@ If the user wants a **public skill**, before validation:
    pnpm skills:sync
    ```
 
-This copies the skill to `.claude/skills/<skill-name>/`.
+This mirrors the full public skill directory to `.claude/skills/<skill-name>/`, including repo-local helpers such as `scripts/` or `assets/`.
 
 **Note**: `pnpm skills:check` primarily validates public skills (those in `public-skills.txt`) and also verifies related governance files, so you must sync first before validating.
 

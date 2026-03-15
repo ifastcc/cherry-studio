@@ -10,6 +10,7 @@ import {
   CLAUDE_SKILLS_DIR,
   CLAUDE_SKILLS_GITIGNORE,
   listSkillNames,
+  listSkillRelativeFiles,
   readFileSafe,
   ROOT_DIR
 } from './skills-common'
@@ -34,52 +35,59 @@ function checkGitignore(filePath: string, expected: string, displayPath: string,
 }
 
 /**
- * Verifies `.claude/skills/<skillName>/SKILL.md` is correctly synced with
- * `.agents/skills/<skillName>/SKILL.md`.
- * Requires regular files (symlinks are disallowed for cross-platform compatibility).
+ * Verifies `.claude/skills/<skillName>/` matches `.agents/skills/<skillName>/`.
+ * Public skills may contain scripts and templates, so validation compares the full directory.
  */
-function checkClaudeSkillFile(skillName: string, errors: string[]) {
-  const skillDir = path.join(CLAUDE_SKILLS_DIR, skillName)
-  const skillFile = path.join(skillDir, 'SKILL.md')
-  const agentsSkillFile = path.join(AGENTS_SKILLS_DIR, skillName, 'SKILL.md')
+function checkClaudeSkillDirectory(skillName: string, errors: string[]) {
+  const agentsSkillDir = path.join(AGENTS_SKILLS_DIR, skillName)
+  const claudeSkillDir = path.join(CLAUDE_SKILLS_DIR, skillName)
 
-  if (!fs.existsSync(skillDir)) {
+  if (!fs.existsSync(claudeSkillDir)) {
     errors.push(`.claude/skills/${skillName} is missing`)
     return
   }
 
-  if (!fs.statSync(skillDir).isDirectory()) {
+  if (!fs.statSync(claudeSkillDir).isDirectory()) {
     errors.push(`.claude/skills/${skillName} is not a directory`)
     return
   }
 
-  let stat: fs.Stats
+  let expectedFiles: string[]
+  let actualFiles: string[]
   try {
-    stat = fs.lstatSync(skillFile)
-  } catch {
-    errors.push(`.claude/skills/${skillName}/SKILL.md is missing`)
+    expectedFiles = listSkillRelativeFiles(agentsSkillDir)
+    actualFiles = listSkillRelativeFiles(claudeSkillDir)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    errors.push(`failed to inspect public skill '${skillName}': ${message}`)
     return
   }
 
-  if (stat.isSymbolicLink()) {
-    errors.push(`.claude/skills/${skillName}/SKILL.md must be a regular file, not a symlink`)
-    return
+  const expectedFileSet = new Set(expectedFiles)
+  const actualFileSet = new Set(actualFiles)
+
+  for (const relativePath of expectedFiles) {
+    if (!actualFileSet.has(relativePath)) {
+      errors.push(`.claude/skills/${skillName}/${relativePath} is missing`)
+      continue
+    }
+
+    const agentsFile = path.join(agentsSkillDir, relativePath)
+    const claudeFile = path.join(claudeSkillDir, relativePath)
+    const expectedContent = fs.readFileSync(agentsFile)
+    const actualContent = fs.readFileSync(claudeFile)
+
+    if (!actualContent.equals(expectedContent)) {
+      errors.push(
+        `.claude/skills/${skillName}/${relativePath} content differs from .agents/skills/${skillName}/${relativePath}`
+      )
+    }
   }
 
-  if (!stat.isFile()) {
-    errors.push(`.claude/skills/${skillName}/SKILL.md is not a regular file`)
-    return
-  }
-
-  const expectedContent = readFileSafe(agentsSkillFile)
-  const actualContent = readFileSafe(skillFile)
-  if (expectedContent === null || actualContent === null) {
-    errors.push(`failed to read .claude/skills/${skillName}/SKILL.md for content verification`)
-    return
-  }
-
-  if (actualContent !== expectedContent) {
-    errors.push(`.claude/skills/${skillName}/SKILL.md content differs from .agents/skills/${skillName}/SKILL.md`)
+  for (const relativePath of actualFiles) {
+    if (!expectedFileSet.has(relativePath)) {
+      errors.push(`.claude/skills/${skillName}/${relativePath} should not exist (run pnpm skills:sync)`)
+    }
   }
 }
 
@@ -132,7 +140,7 @@ function checkTrackedFilesAgainstWhitelist(skillNames: string[], errors: string[
 /**
  * Validates public skills governance:
  * - generated gitignore files are up to date
- * - Claude skill files match source skills by content
+ * - Claude skill directories match source skill directories by content
  * - tracked skill files do not exceed the public whitelist
  */
 function main() {
@@ -157,7 +165,7 @@ function main() {
       continue
     }
 
-    checkClaudeSkillFile(skillName, errors)
+    checkClaudeSkillDirectory(skillName, errors)
   }
   checkTrackedFilesAgainstWhitelist(skillNames, errors)
 

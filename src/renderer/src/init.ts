@@ -1,3 +1,5 @@
+import './services/TopicDataService'
+
 import KeyvStorage from '@kangfenmao/keyv-storage'
 import { loggerService } from '@logger'
 

@@ -3,5 +3,6 @@
 gh-create-pr
 prepare-release
 create-skill
+cherry-chat-research
 gh-create-issue
 gh-pr-review

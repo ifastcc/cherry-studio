@@ -9,6 +9,7 @@ import { errorHandler } from './middleware/error'
 import { setupOpenAPIDocumentation } from './middleware/openapi'
 import { agentsRoutes } from './routes/agents'
 import { chatRoutes } from './routes/chat'
+import { historyRoutes } from './routes/history'
 import { mcpRoutes } from './routes/mcp'
 import { messagesProviderRoutes, messagesRoutes } from './routes/messages'
 import { modelsRoutes } from './routes/models'
@@ -51,7 +52,7 @@ app.use((_req, res, next) => {
 app.use(
   cors({
     origin: '*',
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
   })
 )
@@ -126,6 +127,12 @@ app.get('/', (_req, res) => {
       chat_completions: 'POST /v1/chat/completions',
       models: 'GET /v1/models',
       messages: 'POST /v1/messages',
+      history_topics: 'GET /v1/history/topics',
+      history_topic: 'GET /v1/history/topics/:topicId',
+      history_topic_messages: 'GET /v1/history/topics/:topicId/messages',
+      history_transcript: 'GET /v1/history/topics/:topicId/transcript',
+      history_message: 'GET /v1/history/messages/:messageId',
+      history_search: 'GET /v1/history/search/messages',
       messages_provider: 'POST /:provider/v1/messages',
       mcps: 'GET /v1/mcps',
       mcp_server: 'GET /v1/mcps/:server_id',
@@ -152,6 +159,7 @@ apiRouter.use('/mcps', mcpRoutes)
 apiRouter.use('/messages', extendMessagesTimeout, messagesRoutes)
 apiRouter.use('/models', modelsRoutes)
 apiRouter.use('/agents', agentsRoutes)
+apiRouter.use('/history', historyRoutes)
 app.use('/v1', apiRouter)
 
 // Error handling (must be last)
