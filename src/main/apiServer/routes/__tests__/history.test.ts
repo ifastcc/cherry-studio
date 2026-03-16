@@ -92,6 +92,36 @@ describe('historyRoutes', () => {
     expect(payload.error.code).toBe('renderer_unavailable')
   })
 
+  it('parses structured search queries with deduplication and sort controls', async () => {
+    historyService.searchMessages.mockResolvedValue({
+      hits: [],
+      total: 0,
+      query: ''
+    })
+
+    const response = await fetch(
+      `${baseUrl}/v1/history/search/messages?anyOf=气感,养气&exclude=天气&sort=relevance&order=desc&deduplicate=true&deduplicateBy=normalizedText`
+    )
+
+    expect(response.status).toBe(200)
+    expect(historyService.searchMessages).toHaveBeenCalledWith('', {
+      messageRange: undefined,
+      assistantId: undefined,
+      topicId: undefined,
+      role: undefined,
+      phrase: undefined,
+      allOf: undefined,
+      anyOf: ['气感', '养气'],
+      exclude: ['天气'],
+      sort: 'relevance',
+      order: 'desc',
+      deduplicate: true,
+      deduplicateBy: 'normalizedText',
+      offset: undefined,
+      limit: undefined
+    })
+  })
+
   it('parses cross-topic message timeline queries', async () => {
     historyService.listAllMessages.mockResolvedValue({
       messages: [],
@@ -132,6 +162,14 @@ describe('historyRoutes', () => {
 
     expect(response.status).toBe(400)
 
+    const payload = await response.json()
+    expect(payload.error.code).toBe('invalid_parameters')
+  })
+
+  it('returns 400 when search omits every positive query clause', async () => {
+    const response = await fetch(`${baseUrl}/v1/history/search/messages?exclude=天气`)
+
+    expect(response.status).toBe(400)
     const payload = await response.json()
     expect(payload.error.code).toBe('invalid_parameters')
   })

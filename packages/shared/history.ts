@@ -149,11 +149,26 @@ export interface MessageBatchResult {
   missingMessageIds: string[]
 }
 
+export interface SearchHitOccurrence {
+  topicId: string
+  topicName: string
+  messageId: string
+  createdAt: string
+}
+
 export interface SearchMessagesOptions {
   messageRange?: TimeRange
   assistantId?: string
   topicId?: string
   role?: 'user' | 'assistant'
+  phrase?: string
+  allOf?: string[]
+  anyOf?: string[]
+  exclude?: string[]
+  sort?: 'createdAt' | 'relevance'
+  order?: 'asc' | 'desc'
+  deduplicate?: boolean
+  deduplicateBy?: 'normalizedText' | 'normalizedTextAndTimestamp'
   limit?: number
   offset?: number
 }
@@ -167,6 +182,9 @@ export interface MessageHit {
   snippet: string
   mainText: string
   createdAt: string
+  contentHash: string
+  duplicateCount?: number
+  appearsInTopics?: SearchHitOccurrence[]
   annotations: MessageAnnotations
 }
 

@@ -41,6 +41,14 @@ const topic: Topic = {
   updatedAt: '2026-03-12T11:30:00.000Z'
 } as Topic
 
+const topicTwo: Topic = {
+  id: 'topic-2',
+  name: 'Architecture Notes',
+  assistantId: 'assistant-1',
+  createdAt: '2026-03-12T12:00:00.000Z',
+  updatedAt: '2026-03-12T12:30:00.000Z'
+} as Topic
+
 const messages = [
   {
     id: 'u1',
@@ -116,6 +124,29 @@ const messages = [
   }
 ] as any[]
 
+const messagesTwo = [
+  {
+    id: 'u3',
+    role: 'user',
+    assistantId: 'assistant-1',
+    topicId: topicTwo.id,
+    createdAt: '2026-03-12T12:01:00.000Z',
+    status: 'success',
+    blocks: ['b-u3']
+  },
+  {
+    id: 'a4',
+    role: 'assistant',
+    assistantId: 'assistant-1',
+    topicId: topicTwo.id,
+    askId: 'u3',
+    createdAt: '2026-03-12T12:02:00.000Z',
+    status: 'success',
+    modelId: 'gpt-5',
+    blocks: ['b-a4']
+  }
+] as any[]
+
 const blocks = new Map(
   [
     ['b-u1', 'Help me review the architecture'],
@@ -123,7 +154,9 @@ const blocks = new Map(
     ['b-a2', 'Preferred reply'],
     ['b-a-orphan', 'Detached follow-up note'],
     ['b-u2', 'Check the deployment risks'],
-    ['b-a3', 'Final follow-up reply']
+    ['b-a3', 'Final follow-up reply'],
+    ['b-u3', 'Check the deployment risks again'],
+    ['b-a4', 'Final follow-up reply']
   ].map(([id, content]) => [
     id,
     {
@@ -154,7 +187,7 @@ describe('TopicDataService', () => {
           {
             id: 'assistant-1',
             name: 'Architect',
-            topics: [topic]
+            topics: [topic, topicTwo]
           }
         ]
       }
@@ -164,11 +197,22 @@ describe('TopicDataService', () => {
       if (topicId === topic.id) {
         return { id: topic.id, messages }
       }
+      if (topicId === topicTwo.id) {
+        return { id: topicTwo.id, messages: messagesTwo }
+      }
       return undefined
     })
 
     mockDb.topics.bulkGet.mockImplementation(async (topicIds: string[]) =>
-      topicIds.map((topicId) => (topicId === topic.id ? { id: topic.id, messages } : undefined))
+      topicIds.map((topicId) => {
+        if (topicId === topic.id) {
+          return { id: topic.id, messages }
+        }
+        if (topicId === topicTwo.id) {
+          return { id: topicTwo.id, messages: messagesTwo }
+        }
+        return undefined
+      })
     )
 
     mockDb.message_blocks.bulkGet.mockImplementation(async (blockIds: string[]) =>
@@ -180,8 +224,9 @@ describe('TopicDataService', () => {
 
   it('excludes clear messages from topic counts and timestamps', async () => {
     const result = await topicDataService.listTopics()
-    expect(result.total).toBe(1)
-    expect(result.topics[0]).toMatchObject({
+    expect(result.total).toBe(2)
+    const architectureReview = result.topics.find((entry) => entry.topicId === topic.id)
+    expect(architectureReview).toMatchObject({
       topicId: topic.id,
       messageCount: 6,
       roundCount: 2,
@@ -282,6 +327,7 @@ describe('TopicDataService', () => {
 
   it('filters search hits by message timestamp instead of topic timestamp', async () => {
     const result = await topicDataService.searchMessages('follow-up', {
+      topicId: topic.id,
       messageRange: {
         from: '2026-03-12T00:00:00.000Z',
         to: '2026-03-12T23:59:59.000Z'
@@ -330,18 +376,18 @@ describe('TopicDataService', () => {
       limit: 2
     })
 
-    expect(firstPage.messages.map((message) => message.messageId)).toEqual(['a3', 'u2'])
+    expect(firstPage.messages.map((message) => message.messageId)).toEqual(['a4', 'u3'])
     expect(firstPage.messages[0]).toMatchObject({
-      topicId: topic.id,
-      topicName: topic.name,
+      topicId: topicTwo.id,
+      topicName: topicTwo.name,
       assistantName: 'Architect',
       mainText: 'Final follow-up reply'
     })
     expect(firstPage.pageInfo).toEqual({
       hasMore: true,
-      nextCursor: 'u2',
+      nextCursor: 'u3',
       returnedMessages: 2,
-      totalMessages: 6
+      totalMessages: 8
     })
 
     const secondPage = await topicDataService.listAllMessages({
@@ -350,6 +396,51 @@ describe('TopicDataService', () => {
       limit: 10
     })
 
-    expect(secondPage.messages.map((message) => message.messageId)).toEqual(['a-orphan', 'a2', 'a1', 'u1'])
+    expect(secondPage.messages.map((message) => message.messageId)).toEqual(['a3', 'u2', 'a-orphan', 'a2', 'a1', 'u1'])
+  })
+
+  it('supports structured search criteria and deduplicates duplicate content across topics', async () => {
+    const result = await topicDataService.searchMessages('', {
+      anyOf: ['follow-up'],
+      exclude: ['detached'],
+      deduplicate: true,
+      deduplicateBy: 'normalizedText',
+      sort: 'createdAt',
+      order: 'desc'
+    })
+
+    expect(result.hits).toHaveLength(1)
+    expect(result.hits[0]).toMatchObject({
+      messageId: 'a4',
+      topicId: topicTwo.id,
+      mainText: 'Final follow-up reply',
+      contentHash: expect.any(String),
+      duplicateCount: 2,
+      appearsInTopics: [
+        {
+          topicId: topicTwo.id,
+          topicName: topicTwo.name,
+          messageId: 'a4',
+          createdAt: '2026-03-12T12:02:00.000Z'
+        },
+        {
+          topicId: topic.id,
+          topicName: topic.name,
+          messageId: 'a3',
+          createdAt: '2026-03-12T11:05:00.000Z'
+        }
+      ]
+    })
+  })
+
+  it('supports AND-style search terms and relevance ordering', async () => {
+    const result = await topicDataService.searchMessages('reply', {
+      allOf: ['final', 'follow-up'],
+      sort: 'relevance',
+      order: 'desc'
+    })
+
+    expect(result.hits.slice(0, 2).map((hit) => hit.messageId)).toEqual(['a4', 'a3'])
+    expect(result.hits[0].mainText).toBe('Final follow-up reply')
   })
 })

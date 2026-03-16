@@ -88,6 +88,18 @@ interface TopicMessageRef {
   annotations: Map<string, MessageAnnotations>
 }
 
+interface SearchMatchCriteria {
+  query?: string
+  phrase?: string
+  allOf: string[]
+  anyOf: string[]
+  exclude: string[]
+}
+
+type SearchHitDraft = SearchMessagesResult['hits'][number] & {
+  relevanceScore: number
+}
+
 class TopicDataService {
   private static instance: TopicDataService
 
@@ -367,8 +379,8 @@ class TopicDataService {
   }
 
   async searchMessages(query: string, options?: SearchMessagesOptions): Promise<SearchMessagesResult> {
-    const trimmedQuery = query.trim()
-    if (!trimmedQuery) {
+    const criteria = this.buildSearchCriteria(query, options)
+    if (!criteria) {
       return {
         hits: [],
         total: 0,
@@ -378,7 +390,10 @@ class TopicDataService {
 
     const limit = options?.limit ?? 20
     const offset = options?.offset ?? 0
-    const lowerQuery = trimmedQuery.toLowerCase()
+    const sort = options?.sort ?? 'createdAt'
+    const order = options?.order ?? 'desc'
+    const deduplicate = options?.deduplicate ?? false
+    const deduplicateBy = options?.deduplicateBy ?? 'normalizedText'
     const metas = this.getAllTopicMeta().filter((meta) => {
       if (options?.assistantId && meta.assistantId !== options.assistantId) {
         return false
@@ -391,7 +406,7 @@ class TopicDataService {
       return true
     })
 
-    const hits: SearchMessagesResult['hits'] = []
+    const hits: SearchHitDraft[] = []
 
     for (const meta of metas) {
       const topicData = await db.topics.get(meta.topic.id)
@@ -413,14 +428,15 @@ class TopicDataService {
         }
 
         const mainText = this.extractMainText(message, blocksMap)
-        const index = mainText.toLowerCase().indexOf(lowerQuery)
-        if (index === -1) {
+        const match = this.matchSearchText(mainText, criteria)
+        if (!match) {
           continue
         }
 
-        const start = Math.max(0, index - 80)
-        const end = Math.min(mainText.length, index + trimmedQuery.length + 80)
+        const start = Math.max(0, match.snippetStart - 80)
+        const end = Math.min(mainText.length, match.snippetEnd + 80)
         const snippet = `${start > 0 ? '…' : ''}${mainText.slice(start, end)}${end < mainText.length ? '…' : ''}`
+        const contentHash = this.hashSearchContent(mainText)
 
         hits.push({
           topicId: meta.topic.id,
@@ -431,16 +447,22 @@ class TopicDataService {
           snippet,
           mainText,
           createdAt: message.createdAt,
-          annotations: this.mustGetAnnotations(annotations, message.id)
+          contentHash,
+          annotations: this.mustGetAnnotations(annotations, message.id),
+          relevanceScore: match.score
         })
       }
     }
 
-    hits.sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
+    hits.sort((left, right) => this.compareSearchHits(left, right, sort, order))
+
+    const finalHits = deduplicate
+      ? this.deduplicateSearchHits(hits, deduplicateBy)
+      : hits.map((hit) => this.toSearchHit(hit))
 
     return {
-      hits: hits.slice(offset, offset + limit),
-      total: hits.length,
+      hits: finalHits.slice(offset, offset + limit),
+      total: finalHits.length,
       query
     }
   }
@@ -938,6 +960,221 @@ class TopicDataService {
     }
 
     return true
+  }
+
+  private buildSearchCriteria(query: string, options?: SearchMessagesOptions): SearchMatchCriteria | undefined {
+    const trimTerm = (value?: string) => value?.trim().toLowerCase() || undefined
+    const normalizeTerms = (values?: string[]) =>
+      (values || []).map((value) => value.trim().toLowerCase()).filter(Boolean)
+
+    const criteria: SearchMatchCriteria = {
+      query: trimTerm(query),
+      phrase: trimTerm(options?.phrase),
+      allOf: normalizeTerms(options?.allOf),
+      anyOf: normalizeTerms(options?.anyOf),
+      exclude: normalizeTerms(options?.exclude)
+    }
+
+    if (!criteria.query && !criteria.phrase && !criteria.allOf.length && !criteria.anyOf.length) {
+      return undefined
+    }
+
+    return criteria
+  }
+
+  private matchSearchText(
+    mainText: string,
+    criteria: SearchMatchCriteria
+  ): { score: number; snippetStart: number; snippetEnd: number } | undefined {
+    const haystack = mainText.toLowerCase()
+    const indexes: number[] = []
+    let score = 0
+
+    if (criteria.query) {
+      const index = haystack.indexOf(criteria.query)
+      if (index === -1) {
+        return undefined
+      }
+      indexes.push(index)
+      score += 5 + this.countOccurrences(haystack, criteria.query)
+    }
+
+    if (criteria.phrase) {
+      const index = haystack.indexOf(criteria.phrase)
+      if (index === -1) {
+        return undefined
+      }
+      indexes.push(index)
+      score += 6 + this.countOccurrences(haystack, criteria.phrase)
+    }
+
+    for (const term of criteria.allOf) {
+      const index = haystack.indexOf(term)
+      if (index === -1) {
+        return undefined
+      }
+      indexes.push(index)
+      score += 4 + this.countOccurrences(haystack, term)
+    }
+
+    if (criteria.anyOf.length) {
+      const matchedAny = criteria.anyOf
+        .map((term) => ({ term, index: haystack.indexOf(term) }))
+        .filter((entry) => entry.index !== -1)
+      if (!matchedAny.length) {
+        return undefined
+      }
+
+      matchedAny.forEach((entry) => {
+        indexes.push(entry.index)
+        score += 2 + this.countOccurrences(haystack, entry.term)
+      })
+    }
+
+    for (const term of criteria.exclude) {
+      if (haystack.includes(term)) {
+        return undefined
+      }
+    }
+
+    const snippetStart = indexes.length ? Math.min(...indexes) : 0
+    const snippetEnd = indexes.length
+      ? Math.max(
+          ...indexes.map((index) => {
+            const lengths = [criteria.query, criteria.phrase, ...criteria.allOf, ...criteria.anyOf]
+              .filter(Boolean)
+              .map((term) => (haystack.startsWith(term as string, index) ? (term as string).length : 0))
+            return index + Math.max(...lengths, 1)
+          })
+        )
+      : Math.min(mainText.length, 1)
+
+    return {
+      score,
+      snippetStart,
+      snippetEnd
+    }
+  }
+
+  private countOccurrences(haystack: string, needle: string): number {
+    if (!needle) {
+      return 0
+    }
+
+    let count = 0
+    let index = haystack.indexOf(needle)
+    while (index !== -1) {
+      count += 1
+      index = haystack.indexOf(needle, index + needle.length)
+    }
+    return count
+  }
+
+  private compareSearchHits(
+    left: SearchHitDraft,
+    right: SearchHitDraft,
+    sort: NonNullable<SearchMessagesOptions['sort']>,
+    order: NonNullable<SearchMessagesOptions['order']>
+  ): number {
+    const compareCreatedAt = new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime()
+    const compareRelevance = left.relevanceScore - right.relevanceScore
+
+    let delta = 0
+    if (sort === 'relevance') {
+      delta = compareRelevance || compareCreatedAt
+    } else {
+      delta = compareCreatedAt || compareRelevance
+    }
+
+    if (delta === 0) {
+      delta = left.messageId.localeCompare(right.messageId)
+    }
+
+    return order === 'asc' ? delta : -delta
+  }
+
+  private deduplicateSearchHits(
+    hits: SearchHitDraft[],
+    deduplicateBy: NonNullable<SearchMessagesOptions['deduplicateBy']>
+  ): SearchMessagesResult['hits'] {
+    const grouped = new Map<string, SearchHitDraft[]>()
+    for (const hit of hits) {
+      const key = this.buildDeduplicationKey(hit.mainText, hit.createdAt, deduplicateBy)
+      const existing = grouped.get(key)
+      if (existing) {
+        existing.push(hit)
+      } else {
+        grouped.set(key, [hit])
+      }
+    }
+
+    const seen = new Set<string>()
+    const result: SearchMessagesResult['hits'] = []
+
+    for (const hit of hits) {
+      const key = this.buildDeduplicationKey(hit.mainText, hit.createdAt, deduplicateBy)
+      if (seen.has(key)) {
+        continue
+      }
+
+      seen.add(key)
+      const group = grouped.get(key) || [hit]
+      const baseHit = this.toSearchHit(hit)
+      result.push({
+        ...baseHit,
+        duplicateCount: group.length,
+        appearsInTopics:
+          group.length > 1
+            ? group.map((entry) => ({
+                topicId: entry.topicId,
+                topicName: entry.topicName,
+                messageId: entry.messageId,
+                createdAt: entry.createdAt
+              }))
+            : undefined
+      })
+    }
+
+    return result
+  }
+
+  private buildDeduplicationKey(
+    mainText: string,
+    createdAt: string,
+    mode: NonNullable<SearchMessagesOptions['deduplicateBy']>
+  ): string {
+    return this.hashSearchContent(mainText, createdAt, mode)
+  }
+
+  private toSearchHit(hit: SearchHitDraft): SearchMessagesResult['hits'][number] {
+    return {
+      topicId: hit.topicId,
+      topicName: hit.topicName,
+      assistantName: hit.assistantName,
+      messageId: hit.messageId,
+      role: hit.role,
+      snippet: hit.snippet,
+      mainText: hit.mainText,
+      createdAt: hit.createdAt,
+      contentHash: hit.contentHash,
+      duplicateCount: hit.duplicateCount,
+      appearsInTopics: hit.appearsInTopics,
+      annotations: hit.annotations
+    }
+  }
+
+  private hashSearchContent(
+    mainText: string,
+    createdAt?: string,
+    mode: NonNullable<SearchMessagesOptions['deduplicateBy']> = 'normalizedText'
+  ): string {
+    const normalized = mainText.replace(/\s+/g, ' ').trim().toLowerCase()
+    const source = mode === 'normalizedTextAndTimestamp' && createdAt ? `${normalized}@@${createdAt}` : normalized
+    let hash = 5381
+    for (let index = 0; index < source.length; index += 1) {
+      hash = (hash * 33) ^ source.charCodeAt(index)
+    }
+    return `h${(hash >>> 0).toString(16)}`
   }
 }
 

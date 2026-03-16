@@ -41,6 +41,50 @@ function parseEnumQuery<T extends string>(value: unknown, field: string, values:
   return value as T
 }
 
+function parseBooleanQuery(value: unknown, field: string): boolean | undefined {
+  if (value === undefined) {
+    return undefined
+  }
+
+  if (typeof value === 'boolean') {
+    return value
+  }
+
+  if (typeof value !== 'string') {
+    throw new TopicDataBadRequestError(`${field} must be a boolean`)
+  }
+
+  if (value === 'true') {
+    return true
+  }
+
+  if (value === 'false') {
+    return false
+  }
+
+  throw new TopicDataBadRequestError(`${field} must be true or false`)
+}
+
+function parseStringListQuery(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) {
+    return undefined
+  }
+
+  const values = Array.isArray(value) ? value : [value]
+  const items = values.flatMap((entry) => {
+    if (typeof entry !== 'string') {
+      throw new TopicDataBadRequestError(`${field} must contain strings`)
+    }
+
+    return entry
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+  })
+
+  return items.length ? items : undefined
+}
+
 function parseTimeRangeQuery(req: Request, options: { rangeKey: string; fromKey: string; toKey: string }) {
   const rangeValue = req.query[options.rangeKey]
   if (typeof rangeValue === 'string' && rangeValue.trim()) {
@@ -548,12 +592,11 @@ router.get('/messages/:messageId', async (req: Request, res: Response) => {
  * /v1/history/search/messages:
  *   get:
  *     summary: Search chat history messages
- *     description: Performs message-level full text search across chat history and returns hits with annotations.
+ *     description: Performs message-level search across chat history and returns hits with snippets, full mainText, createdAt, and message annotations. At least one positive search clause is required: q, phrase, allOf, or anyOf.
  *     tags: [History]
  *     parameters:
  *       - in: query
  *         name: q
- *         required: true
  *         schema:
  *           type: string
  *       - in: query
@@ -580,6 +623,50 @@ router.get('/messages/:messageId', async (req: Request, res: Response) => {
  *           type: string
  *           enum: [user, assistant]
  *       - in: query
+ *         name: phrase
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: allOf
+ *         description: Repeat the parameter or provide a comma-separated list to require all terms.
+ *         schema:
+ *           type: array
+ *           items:
+ *             type: string
+ *       - in: query
+ *         name: anyOf
+ *         description: Repeat the parameter or provide a comma-separated list to match any term.
+ *         schema:
+ *           type: array
+ *           items:
+ *             type: string
+ *       - in: query
+ *         name: exclude
+ *         description: Repeat the parameter or provide a comma-separated list to exclude terms.
+ *         schema:
+ *           type: array
+ *           items:
+ *             type: string
+ *       - in: query
+ *         name: sort
+ *         schema:
+ *           type: string
+ *           enum: [createdAt, relevance]
+ *       - in: query
+ *         name: order
+ *         schema:
+ *           type: string
+ *           enum: [asc, desc]
+ *       - in: query
+ *         name: deduplicate
+ *         schema:
+ *           type: boolean
+ *       - in: query
+ *         name: deduplicateBy
+ *         schema:
+ *           type: string
+ *           enum: [normalizedText, normalizedTextAndTimestamp]
+ *       - in: query
  *         name: offset
  *         schema:
  *           type: integer
@@ -600,8 +687,12 @@ router.get('/messages/:messageId', async (req: Request, res: Response) => {
 router.get('/search/messages', async (req: Request, res: Response) => {
   try {
     const query = typeof req.query.q === 'string' ? req.query.q : ''
-    if (!query.trim()) {
-      throw new TopicDataBadRequestError('q is required')
+    const phrase = typeof req.query.phrase === 'string' ? req.query.phrase : undefined
+    const allOf = parseStringListQuery(req.query.allOf, 'allOf')
+    const anyOf = parseStringListQuery(req.query.anyOf, 'anyOf')
+    const exclude = parseStringListQuery(req.query.exclude, 'exclude')
+    if (!query.trim() && !phrase?.trim() && !allOf?.length && !anyOf?.length) {
+      throw new TopicDataBadRequestError('At least one of q, phrase, allOf, or anyOf is required')
     }
 
     const result = await historyService.searchMessages(query, {
@@ -613,6 +704,17 @@ router.get('/search/messages', async (req: Request, res: Response) => {
       assistantId: typeof req.query.assistantId === 'string' ? req.query.assistantId : undefined,
       topicId: typeof req.query.topicId === 'string' ? req.query.topicId : undefined,
       role: parseEnumQuery(req.query.role, 'role', ['user', 'assistant']),
+      phrase,
+      allOf,
+      anyOf,
+      exclude,
+      sort: parseEnumQuery(req.query.sort, 'sort', ['createdAt', 'relevance']),
+      order: parseEnumQuery(req.query.order, 'order', ['asc', 'desc']),
+      deduplicate: parseBooleanQuery(req.query.deduplicate, 'deduplicate'),
+      deduplicateBy: parseEnumQuery(req.query.deduplicateBy, 'deduplicateBy', [
+        'normalizedText',
+        'normalizedTextAndTimestamp'
+      ]),
       offset: parseIntegerQuery(req.query.offset, 'offset', { min: 0 }),
       limit: parseIntegerQuery(req.query.limit, 'limit', { min: 1 })
     })
