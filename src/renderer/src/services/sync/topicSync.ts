@@ -1668,8 +1668,6 @@ async function syncOnce(): Promise<void> {
     let staleCount = 0
     let failedCount = 0
     const failedActions: SyncFailureItem[] = []
-    const assistants = cloneAssistantsForUpdate()
-    const assistantsChanged = false
     const recordFailure = (
       topicId: string,
       op: 'upsert' | 'delete',
@@ -2024,6 +2022,8 @@ async function triggerFullPushToServer(options?: { pruneRemote?: boolean }): Pro
 
     const newSyncedRevisions = new Map<string, number>()
     let pushProcessed = 0
+    const assistants = cloneAssistantsForUpdate()
+    let assistantsChanged = false
 
     for (let i = 0; i < toPush.length; i += BATCH_SIZE) {
       const batch = toPush.slice(i, i + BATCH_SIZE)

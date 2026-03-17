@@ -100,7 +100,6 @@ jobs:
           set -euo pipefail
 
           declare -a FORK_OWNED_PATHS=(
-            .agents
             .claude
             .github/workflows
             electron-builder.yml

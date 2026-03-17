@@ -592,7 +592,10 @@ router.get('/messages/:messageId', async (req: Request, res: Response) => {
  * /v1/history/search/messages:
  *   get:
  *     summary: Search chat history messages
- *     description: Performs message-level search across chat history and returns hits with snippets, full mainText, createdAt, and message annotations. At least one positive search clause is required: q, phrase, allOf, or anyOf.
+ *     description: >-
+ *       Performs message-level search across chat history and returns hits with
+ *       snippets, full mainText, createdAt, and message annotations. At least
+ *       one positive search clause is required: q, phrase, allOf, or anyOf.
  *     tags: [History]
  *     parameters:
  *       - in: query
