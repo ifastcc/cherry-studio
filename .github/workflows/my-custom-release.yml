@@ -91,13 +91,23 @@ jobs:
           echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
           echo "tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Sync upstream tag into main (preserve workflows)
+      - name: Sync upstream tag into main (preserve fork-owned paths)
         if: steps.resolve.outputs.should_build == 'true'
         env:
           TARGET_TAG: ${{ steps.resolve.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
+
+          declare -a FORK_OWNED_PATHS=(
+            .agents
+            .claude
+            .github/workflows
+            electron-builder.yml
+            scripts/skills-check.ts
+            scripts/skills-common.ts
+            scripts/skills-sync.ts
+          )
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -124,38 +134,34 @@ jobs:
             fi
           fi
 
-          if [ "$MERGE_FAILED" = "true" ]; then
-            if ! git diff --name-only --diff-filter=U | grep -q .; then
-              echo "::error::Merge failed unexpectedly while syncing ${TARGET_TAG}."
-              git merge --abort || true
-              exit 1
-            fi
+          if [ "$MERGE_FAILED" = "true" ] && [ "$MERGE_STARTED" != "true" ]; then
+            echo "::error::Merge failed unexpectedly while syncing ${TARGET_TAG}."
+            git merge --abort || true
+            exit 1
+          fi
 
+          if [ "$MERGE_STARTED" = "true" ]; then
+            UNMERGED_CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
             while IFS= read -r conflict_file; do
-              case "$conflict_file" in
-                .github/workflows/*|electron-builder.yml)
-                  git checkout --ours -- "$conflict_file"
-                  git add "$conflict_file"
-                  echo "Auto-resolved ${conflict_file} using fork version."
-                  ;;
-                *)
-                  echo "::warning::Unresolved conflict remains in ${conflict_file}"
-                  ;;
-              esac
-            done < <(git diff --name-only --diff-filter=U)
+              [ -z "$conflict_file" ] && continue
+              if [[ "$conflict_file" == *"~refs_tags_"* ]]; then
+                git rm -rf --ignore-unmatch -- "$conflict_file"
+                echo "Dropped upstream-only conflict path ${conflict_file}."
+              fi
+            done <<< "$UNMERGED_CONFLICTS"
+
+            git checkout --ours -- "${FORK_OWNED_PATHS[@]}"
+            git add "${FORK_OWNED_PATHS[@]}"
+            git restore --source=HEAD --staged --worktree "${FORK_OWNED_PATHS[@]}"
 
             if git diff --name-only --diff-filter=U | grep -q .; then
-              echo "::error::Merge conflicts remain after auto-resolution when syncing ${TARGET_TAG}."
+              echo "::error::Merge conflicts remain after preserving fork-owned paths while syncing ${TARGET_TAG}."
               git diff --name-only --diff-filter=U
               git merge --abort || true
               exit 1
             fi
-          fi
 
-          if [ "$MERGE_STARTED" = "true" ]; then
-            git restore --source=HEAD --staged --worktree .github/workflows/ electron-builder.yml || true
-            git add .github/workflows electron-builder.yml
-            git commit --allow-empty -m "chore: sync upstream ${TARGET_TAG} (preserve workflows)"
+            git commit --allow-empty -m "chore: sync upstream ${TARGET_TAG} (preserve fork paths)"
             git push origin HEAD:main
           else
             echo "main already contains ${TARGET_TAG}; no sync commit needed."
