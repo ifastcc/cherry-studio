@@ -16,7 +16,6 @@ import { buildAgentSessionTopicId } from '@renderer/utils/agentSession'
 import type { MenuProps } from 'antd'
 import { Dropdown, Tooltip } from 'antd'
 import { MenuIcon, Sparkles, XIcon } from 'lucide-react'
-import type { FC } from 'react'
 import React, { memo, startTransition, useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import styled from 'styled-components'
@@ -31,7 +30,7 @@ interface SessionItemProps {
   onPress: () => void
 }
 
-const SessionItem: FC<SessionItemProps> = ({ session, agentId, onDelete, onPress }) => {
+const SessionItem = ({ session, agentId, onDelete, onPress }: SessionItemProps) => {
   const { t } = useTranslation()
   const { chat } = useRuntime()
   const { updateSession } = useUpdateSession(agentId)
@@ -189,9 +188,9 @@ const SessionItem: FC<SessionItemProps> = ({ session, agentId, onDelete, onPress
             <SessionEditInput {...inputProps} style={{ opacity: isSaving ? 0.5 : 1 }} />
           ) : (
             <>
-              <SessionName>
+              <div className="truncate text-[13px]">
                 <SessionLabel session={session} />
-              </SessionName>
+              </div>
               <DeleteButton />
             </>
           )}
@@ -210,7 +209,6 @@ const SessionListItem = styled.div`
   justify-content: space-between;
   cursor: pointer;
   width: calc(var(--assistants-width) - 20px);
-  margin-bottom: 8px;
 
   .menu {
     opacity: 0;
@@ -256,15 +254,6 @@ const SessionNameContainer = styled.div`
   gap: 4px;
   height: 20px;
   justify-content: space-between;
-`
-
-const SessionName = styled.div`
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  font-size: 13px;
-  position: relative;
 `
 
 const SessionEditInput = styled.input`

@@ -1,10 +1,11 @@
-import { DynamicVirtualList, type DynamicVirtualListRef } from '@renderer/components/VirtualList'
+import AddButton from '@renderer/components/AddButton'
+import DraggableVirtualList, { type DraggableVirtualListRef } from '@renderer/components/DraggableList/virtual-list'
 import { useCreateDefaultSession } from '@renderer/hooks/agents/useCreateDefaultSession'
 import { useSessions } from '@renderer/hooks/agents/useSessions'
 import { useRuntime } from '@renderer/hooks/useRuntime'
 import { useAppDispatch } from '@renderer/store'
 import { newMessagesActions } from '@renderer/store/newMessage'
-import { setActiveSessionIdAction, setActiveTopicOrSessionAction } from '@renderer/store/runtime'
+import { setActiveSessionIdAction } from '@renderer/store/runtime'
 import { buildAgentSessionTopicId } from '@renderer/utils/agentSession'
 import { formatErrorMessage } from '@renderer/utils/error'
 import { Alert, Button, Spin } from 'antd'
@@ -12,27 +13,36 @@ import { motion } from 'framer-motion'
 import { throttle } from 'lodash'
 import { memo, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import styled from 'styled-components'
 
-import AddButton from './AddButton'
 import SessionItem from './SessionItem'
 
 interface SessionsProps {
   agentId: string
+  onSelectItem?: () => void
 }
 
 const LOAD_MORE_THRESHOLD = 100
 const SCROLL_THROTTLE_DELAY = 150
 
-const Sessions: React.FC<SessionsProps> = ({ agentId }) => {
+const Sessions = ({ agentId, onSelectItem }: SessionsProps) => {
   const { t } = useTranslation()
-  const { sessions, isLoading, error, deleteSession, hasMore, loadMore, isLoadingMore, isValidating, reload } =
-    useSessions(agentId)
+  const {
+    sessions,
+    isLoading,
+    error,
+    deleteSession,
+    hasMore,
+    loadMore,
+    isLoadingMore,
+    isValidating,
+    reload,
+    reorderSessions
+  } = useSessions(agentId)
   const { chat } = useRuntime()
   const { activeSessionIdMap } = chat
   const dispatch = useAppDispatch()
   const { createDefaultSession, creatingSession } = useCreateDefaultSession(agentId)
-  const listRef = useRef<DynamicVirtualListRef>(null)
+  const listRef = useRef<DraggableVirtualListRef>(null)
 
   // Use refs to always read the latest values inside the throttled handler,
   // avoiding stale closures caused by recreating the throttle on each render.
@@ -77,7 +87,6 @@ const Sessions: React.FC<SessionsProps> = ({ agentId }) => {
   const setActiveSessionId = useCallback(
     (agentId: string, sessionId: string | null) => {
       dispatch(setActiveSessionIdAction({ agentId, sessionId }))
-      dispatch(setActiveTopicOrSessionAction('session'))
     },
     [dispatch]
   )
@@ -151,17 +160,18 @@ const Sessions: React.FC<SessionsProps> = ({ agentId }) => {
 
   return (
     <div className="flex h-full flex-col">
-      <StyledVirtualList
+      <DraggableVirtualList
         ref={listRef}
-        className="sessions-tab"
+        className="sessions-tab flex min-h-0 flex-1 flex-col"
+        itemStyle={{ marginBottom: 8 }}
         list={sessions}
         estimateSize={() => 9 * 4}
-        // FIXME: This component only supports CSSProperties
-        scrollerStyle={{ overflowX: 'hidden' }}
-        autoHideScrollbar
+        scrollerStyle={{ overflowX: 'hidden', padding: '12px 10px' }}
+        onUpdate={reorderSessions}
+        itemKey={(index) => sessions[index]?.id ?? index}
         header={
-          <div className="mt-0.5">
-            <AddButton onClick={createDefaultSession} disabled={creatingSession} className="-mt-1 mb-1.5">
+          <div className="-mt-0.5 mb-1.5">
+            <AddButton onClick={createDefaultSession} disabled={creatingSession}>
               {t('agent.session.add.title')}
             </AddButton>
           </div>
@@ -172,10 +182,13 @@ const Sessions: React.FC<SessionsProps> = ({ agentId }) => {
             session={session}
             agentId={agentId}
             onDelete={() => handleDeleteSession(session.id)}
-            onPress={() => setActiveSessionId(agentId, session.id)}
+            onPress={() => {
+              setActiveSessionId(agentId, session.id)
+              onSelectItem?.()
+            }}
           />
         )}
-      </StyledVirtualList>
+      </DraggableVirtualList>
       {isLoadingMore && (
         <div className="flex justify-center py-2">
           <Spin size="small" />
@@ -184,13 +197,5 @@ const Sessions: React.FC<SessionsProps> = ({ agentId }) => {
     </div>
   )
 }
-
-const StyledVirtualList = styled(DynamicVirtualList)`
-  display: flex;
-  flex-direction: column;
-  padding: 12px 10px;
-  flex: 1;
-  min-height: 0;
-` as typeof DynamicVirtualList
 
 export default memo(Sessions)
