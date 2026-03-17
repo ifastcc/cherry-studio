@@ -46,7 +46,7 @@ type ConfigSource = 'localStorage' | 'none'
 type ConnectionStatus = 'unknown' | 'online' | 'offline' | 'unauthorized'
 type SyncMode = 'push_only' | 'manual_pull' | 'auto_safe' | 'auto_full'
 type ConflictPolicy = 'local_wins' | 'server_wins'
-type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'conflict' | 'not_found' | 'error'
+type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'conflict' | 'not_found' | 'tombstoned' | 'error'
 
 interface SyncRuntimeResult {
   added: number
@@ -655,7 +655,9 @@ function toSyncActionResult(
   const item = payload as Record<string, unknown>
   const statusRaw = typeof item.status === 'string' ? item.status : 'error'
   const status = (
-    ['applied', 'noop', 'stale', 'conflict', 'not_found', 'error'].includes(statusRaw) ? statusRaw : 'error'
+    ['applied', 'noop', 'stale', 'conflict', 'not_found', 'tombstoned', 'error'].includes(statusRaw)
+      ? statusRaw
+      : 'error'
   ) as SyncActionStatus
 
   return {
@@ -1568,8 +1570,24 @@ async function syncOnce(): Promise<void> {
       if (!localHas) {
         // 服务端有、本地没有
         if (isDirty) {
-          // 本地曾删除此 topic 但标记了 dirty（本地删除待推送）
-          toDeleteRemoteSet.add(topicId)
+          // 本地删除 vs 服务端更新：按冲突策略处理，而不是无条件复活或无条件删除。
+          if (entry.revision > syncedRev) {
+            if (syncMode === 'auto_full') {
+              if (conflictPolicy === 'server_wins') {
+                toFetchSet.add(topicId)
+              } else {
+                toDeleteRemoteSet.add(topicId)
+              }
+            } else if (syncMode === 'auto_safe') {
+              conflictCount++
+              conflictItems.push({ topicId, op: 'delete', status: 'conflict', error: 'local_deleted_server_updated' })
+            } else {
+              toDeleteRemoteSet.add(topicId)
+            }
+          } else {
+            // 本地曾删除此 topic 且服务端没有更新 → 继续将删除同步到服务端
+            toDeleteRemoteSet.add(topicId)
+          }
         } else if (syncMode !== 'push_only') {
           toFetchSet.add(topicId)
           // 本地不存在 → 新增
@@ -1610,6 +1628,14 @@ async function syncOnce(): Promise<void> {
           toPushSet.add(topicId)
         }
       } else {
+        const manifestEntry = manifest.entries[topicId]
+        const syncedRev = syncedRevisions.get(topicId) ?? -1
+
+        // 该场景已在 manifest 主循环里按冲突策略处理过，这里避免再次把远端更新误判为删除。
+        if (manifestEntry && manifestEntry.deletedAt == null && manifestEntry.revision > syncedRev) {
+          continue
+        }
+
         // 本地没有此 topic（已删除）→ 推送删除
         toDeleteRemoteSet.add(topicId)
       }
@@ -1642,6 +1668,8 @@ async function syncOnce(): Promise<void> {
     let staleCount = 0
     let failedCount = 0
     const failedActions: SyncFailureItem[] = []
+    const assistants = cloneAssistantsForUpdate()
+    const assistantsChanged = false
     const recordFailure = (
       topicId: string,
       op: 'upsert' | 'delete',
@@ -1720,6 +1748,8 @@ async function syncOnce(): Promise<void> {
       let pushProcessed = 0
       let pushFailed = 0
       const forceWrite = syncMode === 'auto_full' && conflictPolicy === 'local_wins'
+      const assistants = cloneAssistantsForUpdate()
+      let assistantsChanged = false
 
       for (let i = 0; i < toPush.length; i += BATCH_SIZE) {
         const batch = toPush.slice(i, i + BATCH_SIZE)
@@ -1744,6 +1774,20 @@ async function syncOnce(): Promise<void> {
           const result = results.get(topic.topicId)
           const status: SyncActionStatus = result?.status ?? 'error'
 
+          if (status === 'tombstoned') {
+            await applyDeleteToDb(topic.topicId)
+            if (removeTopicMetaFromAssistants(assistants, topic.topicId)) {
+              assistantsChanged = true
+            }
+            if (result?.revision != null) {
+              syncedRevisions.set(topic.topicId, result.revision)
+            }
+            dirtyTopicIds.delete(topic.topicId)
+            appliedCount++
+            pushProcessed++
+            continue
+          }
+
           if (TERMINAL_STATUSES.has(status)) {
             // 更新 syncedRevision
             if (result?.revision != null) {
@@ -1767,6 +1811,17 @@ async function syncOnce(): Promise<void> {
           updateSyncRuntimeState({
             syncProgress: { phase: 'push_upsert', total: toPush.length, processed: pushProcessed, failed: pushFailed }
           })
+        }
+      }
+
+      if (assistantsChanged) {
+        try {
+          store.dispatch(updateAssistants(assistants))
+        } catch (dispatchErr) {
+          logger.error(
+            'Failed to dispatch updateAssistants after tombstoned upsert resolution',
+            dispatchErr instanceof Error ? dispatchErr : new Error(String(dispatchErr))
+          )
         }
       }
     }
@@ -1990,6 +2045,19 @@ async function triggerFullPushToServer(options?: { pruneRemote?: boolean }): Pro
           const result = results.get(topic.topicId)
           const status: SyncActionStatus = result?.status ?? 'error'
 
+          if (status === 'tombstoned') {
+            await applyDeleteToDb(topic.topicId)
+            if (removeTopicMetaFromAssistants(assistants, topic.topicId)) {
+              assistantsChanged = true
+            }
+            if (result?.revision != null) {
+              newSyncedRevisions.set(topic.topicId, result.revision)
+            }
+            appliedCount++
+            pushProcessed++
+            continue
+          }
+
           if (result?.revision != null) {
             newSyncedRevisions.set(topic.topicId, result.revision)
           }
@@ -2008,6 +2076,17 @@ async function triggerFullPushToServer(options?: { pruneRemote?: boolean }): Pro
       updateSyncRuntimeState({
         syncProgress: { phase: 'push_upsert', total: toPush.length, processed: pushProcessed, failed: failedCount }
       })
+    }
+
+    if (assistantsChanged) {
+      try {
+        store.dispatch(updateAssistants(assistants))
+      } catch (dispatchErr) {
+        logger.error(
+          'Failed to dispatch updateAssistants after tombstoned full-push resolution',
+          dispatchErr instanceof Error ? dispatchErr : new Error(String(dispatchErr))
+        )
+      }
     }
 
     // 5. 批量删除远程

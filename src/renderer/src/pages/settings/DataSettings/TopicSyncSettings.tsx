@@ -21,7 +21,7 @@ type ConfigSource = 'localStorage' | 'none'
 type ConnectionStatus = 'unknown' | 'online' | 'offline' | 'unauthorized'
 type SyncMode = 'push_only' | 'manual_pull' | 'auto_safe' | 'auto_full'
 type ConflictPolicy = 'local_wins' | 'server_wins'
-type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'conflict' | 'not_found' | 'error'
+type SyncActionStatus = 'applied' | 'noop' | 'stale' | 'conflict' | 'not_found' | 'tombstoned' | 'error'
 
 interface SyncFailureItem {
   topicId: string
@@ -182,7 +182,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function parseFailureItems(raw: unknown): SyncFailureItem[] {
   if (!Array.isArray(raw)) return []
-  const statuses: SyncActionStatus[] = ['applied', 'noop', 'stale', 'conflict', 'not_found', 'error']
+  const statuses: SyncActionStatus[] = ['applied', 'noop', 'stale', 'conflict', 'not_found', 'tombstoned', 'error']
 
   return raw
     .map((entry): SyncFailureItem | null => {
