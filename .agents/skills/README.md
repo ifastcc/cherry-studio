@@ -24,12 +24,19 @@ For each new public skill, run:
 pnpm skills:sync
 ```
 
-`skills:sync` will create/update `.claude/skills/<skill-name>/` as a mirror of the public skill directory:
+`skills:sync` will create/update `.claude/skills/<skill-name>` as a symlink pointing to `../../.agents/skills/<skill-name>`.
 
-- `SKILL.md` is copied from `.agents/skills/<skill-name>/SKILL.md`.
-- repo-local files such as `scripts/` or `assets/` are mirrored too.
-- generated artifacts like `__pycache__/`, `*.pyc`, and `.DS_Store` stay ignored.
-- symlinks are not allowed; check enforces regular files for compatibility.
+## Windows Compatibility
+
+This project uses symlinks to synchronize files such as AGENTS.md and skills. Windows developers must enable symlink support:
+
+1. **Enable Developer Mode** (Settings → Update & Security → For developers), or
+2. **Grant `SeCreateSymbolicLinkPrivilege`** via Local Security Policy (`secpol.msc`).
+3. **Configure Git** to create symlinks:
+   ```bash
+   git config --global core.symlinks true
+   ```
+4. Re-clone the repository (or run `pnpm skills:sync`) after enabling symlink support.
 
 ## White-list Tracking Rules
 
@@ -55,28 +62,4 @@ The sync/check scripts manage and verify:
 
 - `.agents/skills/.gitignore`
 - `.claude/skills/.gitignore`
-- `.claude/skills/<skill-name>/` content matches `.agents/skills/<skill-name>/`
-
-## GitHub Distribution
-
-Public skills in this repository can also be installed and managed with
-[`vercel-labs/skills`](https://github.com/vercel-labs/skills).
-
-Some end-user skills may live in separate repositories.
-For example, `cherry-chat-research` is now maintained in:
-
-- `https://github.com/ifastcc/cherry-chat-research`
-
-Example:
-
-```bash
-npx skills add ifastcc/cherry-chat-research --skill cherry-chat-research -a codex -a claude-code
-npx skills check
-npx skills update
-```
-
-Use repository-native workflows for skills that still live here:
-
-- edit under `.agents/skills`
-- keep `public-skills.txt` as the whitelist
-- run `pnpm skills:sync` and `pnpm skills:check`
+- `.claude/skills/<skill-name>` is a valid symlink to `.agents/skills/<skill-name>`

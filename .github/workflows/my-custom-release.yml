@@ -100,12 +100,8 @@ jobs:
           set -euo pipefail
 
           declare -a FORK_OWNED_PATHS=(
-            .claude
             .github/workflows
             electron-builder.yml
-            scripts/skills-check.ts
-            scripts/skills-common.ts
-            scripts/skills-sync.ts
           )
 
           git config user.name "github-actions[bot]"

@@ -9,9 +9,6 @@ export const CLAUDE_SKILLS_GITIGNORE = path.join(CLAUDE_SKILLS_DIR, '.gitignore'
 export const PUBLIC_SKILLS_FILE = path.join(AGENTS_SKILLS_DIR, 'public-skills.txt')
 
 const SKILL_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
-const IGNORED_SKILL_DIR_NAMES = new Set(['__pycache__'])
-const IGNORED_SKILL_FILE_PATTERN = /\.(?:pyc|pyo|pyd)$/i
-const IGNORED_SKILL_FILE_NAMES = new Set(['.DS_Store'])
 
 export function listSkillNames(): string[] {
   const content = readFileSafe(PUBLIC_SKILLS_FILE)
@@ -66,9 +63,6 @@ export function buildAgentsSkillsGitignore(skillNames: string[]): string {
   for (const skillName of skillNames) {
     lines.push(`!${skillName}/`)
     lines.push(`!${skillName}/**`)
-    lines.push(`${skillName}/**/__pycache__/`)
-    lines.push(`${skillName}/**/*.py[cod]`)
-    lines.push(`${skillName}/**/.DS_Store`)
   }
 
   return `${lines.join('\n')}\n`
@@ -84,72 +78,10 @@ export function buildClaudeSkillsGitignore(skillNames: string[]): string {
   ]
 
   for (const skillName of skillNames) {
-    lines.push(`!${skillName}/`)
-    lines.push(`!${skillName}/**`)
-    lines.push(`${skillName}/**/__pycache__/`)
-    lines.push(`${skillName}/**/*.py[cod]`)
-    lines.push(`${skillName}/**/.DS_Store`)
+    lines.push(`!${skillName}`)
   }
 
   return `${lines.join('\n')}\n`
-}
-
-export function isIgnoredSkillPath(relativePath: string): boolean {
-  const normalizedPath = relativePath.replace(/\\/g, '/')
-  const segments = normalizedPath.split('/').filter((segment) => segment.length > 0)
-  const basename = path.posix.basename(normalizedPath)
-
-  return (
-    segments.some((segment) => IGNORED_SKILL_DIR_NAMES.has(segment)) ||
-    IGNORED_SKILL_FILE_NAMES.has(basename) ||
-    IGNORED_SKILL_FILE_PATTERN.test(basename)
-  )
-}
-
-export function listSkillRelativeFiles(skillDir: string): string[] {
-  if (!fs.existsSync(skillDir)) {
-    throw new Error(`${skillDir} does not exist`)
-  }
-
-  const rootStat = fs.lstatSync(skillDir)
-  if (rootStat.isSymbolicLink()) {
-    throw new Error(`${skillDir} must be a real directory, not a symlink`)
-  }
-  if (!rootStat.isDirectory()) {
-    throw new Error(`${skillDir} is not a directory`)
-  }
-
-  const files: string[] = []
-
-  function walk(currentDir: string, relativeDir: string) {
-    const entries = fs.readdirSync(currentDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
-
-    for (const entry of entries) {
-      const relativePath = relativeDir === '' ? entry.name : path.posix.join(relativeDir, entry.name)
-      if (isIgnoredSkillPath(relativePath)) {
-        continue
-      }
-
-      const absolutePath = path.join(currentDir, entry.name)
-      const stat = fs.lstatSync(absolutePath)
-
-      if (stat.isSymbolicLink()) {
-        throw new Error(`${absolutePath} must be a regular file or directory, not a symlink`)
-      }
-      if (stat.isDirectory()) {
-        walk(absolutePath, relativePath)
-        continue
-      }
-      if (!stat.isFile()) {
-        throw new Error(`${absolutePath} must be a regular file`)
-      }
-
-      files.push(relativePath)
-    }
-  }
-
-  walk(skillDir, '')
-  return files
 }
 
 export function writeFileIfChanged(filePath: string, content: string): boolean {

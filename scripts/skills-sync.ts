@@ -8,92 +8,50 @@ import {
   buildClaudeSkillsGitignore,
   CLAUDE_SKILLS_GITIGNORE,
   listSkillNames,
-  listSkillRelativeFiles,
   writeFileIfChanged
 } from './skills-common'
 
 /**
- * Ensures `.claude/skills/<skillName>/` mirrors `.agents/skills/<skillName>/`.
- * Public skills can include scripts and templates, so the full directory is synced.
+ * Ensures `.claude/skills/<skillName>` is a symlink pointing to
+ * `../../.agents/skills/<skillName>` (relative to `.claude/skills/`).
  */
-function ensureClaudeSkillDirectory(skillName: string): string[] {
+function ensureClaudeSkillSymlink(skillName: string): boolean {
   const agentsSkillDir = path.join(AGENTS_SKILLS_DIR, skillName)
   const claudeSkillDir = path.join(CLAUDE_SKILLS_DIR, skillName)
-  const agentsSkillFile = path.join(agentsSkillDir, 'SKILL.md')
+  const expectedTarget = path.join('..', '..', '.agents', 'skills', skillName)
 
-  if (!fs.existsSync(agentsSkillFile)) {
-    throw new Error(`.agents/skills/${skillName}/SKILL.md is missing`)
+  if (!fs.existsSync(agentsSkillDir)) {
+    throw new Error(`.agents/skills/${skillName} is missing`)
   }
 
-  fs.mkdirSync(claudeSkillDir, { recursive: true })
+  let existing: fs.Stats | null = null
+  try {
+    existing = fs.lstatSync(claudeSkillDir)
+  } catch (error) {
+    const nodeError = error as NodeJS.ErrnoException
+    if (nodeError.code !== 'ENOENT') {
+      throw error
+    }
+  }
 
-  const changedFiles: string[] = []
-  const expectedFiles = listSkillRelativeFiles(agentsSkillDir)
-  const expectedFileSet = new Set(expectedFiles)
-
-  for (const relativePath of expectedFiles) {
-    const sourceFile = path.join(agentsSkillDir, relativePath)
-    const targetFile = path.join(claudeSkillDir, relativePath)
-
-    fs.mkdirSync(path.dirname(targetFile), { recursive: true })
-
-    const expectedContent = fs.readFileSync(sourceFile)
-
-    let shouldWrite = true
-    try {
-      const existing = fs.lstatSync(targetFile)
-      if (!existing.isFile()) {
-        fs.rmSync(targetFile, { recursive: true, force: true })
-      } else {
-        const currentContent = fs.readFileSync(targetFile)
-        shouldWrite = !currentContent.equals(expectedContent)
-      }
-    } catch (error) {
-      const nodeError = error as NodeJS.ErrnoException
-      if (nodeError.code !== 'ENOENT') {
-        throw error
+  if (existing !== null) {
+    if (existing.isSymbolicLink()) {
+      const currentTarget = fs.readlinkSync(claudeSkillDir)
+      if (currentTarget === expectedTarget) {
+        return false
       }
     }
-
-    if (shouldWrite) {
-      fs.writeFileSync(targetFile, expectedContent)
-      changedFiles.push(`.claude/skills/${skillName}/${relativePath}`)
-    }
+    fs.rmSync(claudeSkillDir, { force: true, recursive: true })
   }
 
-  const actualFiles = listSkillRelativeFiles(claudeSkillDir)
-  for (const relativePath of actualFiles) {
-    if (expectedFileSet.has(relativePath)) {
-      continue
-    }
-
-    fs.rmSync(path.join(claudeSkillDir, relativePath), { force: true })
-    changedFiles.push(`.claude/skills/${skillName}/${relativePath}`)
-  }
-
-  pruneEmptyDirectories(claudeSkillDir)
-
-  return changedFiles
-}
-
-function pruneEmptyDirectories(rootDir: string) {
-  for (const entry of fs.readdirSync(rootDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue
-    }
-
-    const absolutePath = path.join(rootDir, entry.name)
-    pruneEmptyDirectories(absolutePath)
-    if (fs.readdirSync(absolutePath).length === 0) {
-      fs.rmdirSync(absolutePath)
-    }
-  }
+  fs.symlinkSync(expectedTarget, claudeSkillDir)
+  return true
 }
 
 /**
  * Synchronizes skill infrastructure for all public skills:
  * - regenerates whitelist gitignore files
- * - syncs Claude-side skill directories
+ * - syncs Claude-side SKILL.md files
  */
 function main() {
   let skillNames: string[]
@@ -118,7 +76,9 @@ function main() {
     changedFiles.push('.claude/skills/.gitignore')
   }
   for (const skillName of skillNames) {
-    changedSkillFiles.push(...ensureClaudeSkillDirectory(skillName))
+    if (ensureClaudeSkillSymlink(skillName)) {
+      changedSkillFiles.push(`.claude/skills/${skillName}`)
+    }
   }
 
   if (changedFiles.length === 0 && changedSkillFiles.length === 0) {

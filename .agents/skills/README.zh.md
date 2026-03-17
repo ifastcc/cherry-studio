@@ -24,12 +24,19 @@
 pnpm skills:sync
 ```
 
-`skills:sync` 会自动创建/更新 `.claude/skills/<skill-name>/`，作为公共 skill 目录的镜像：
+`skills:sync` 会自动创建/更新 `.claude/skills/<skill-name>` 为指向 `../../.agents/skills/<skill-name>` 的符号链接。
 
-- `SKILL.md` 会从 `.agents/skills/<skill-name>/SKILL.md` 复制过去。
-- `scripts/`、`assets/` 这类仓库内辅助文件也会一起镜像。
-- `__pycache__/`、`*.pyc`、`.DS_Store` 这类派生文件会继续被忽略。
-- 不允许使用符号链接；check 会强制要求为普通文件以保证兼容性。
+## Windows 兼容性
+
+本项目使用符号链接同步 AGENTS.md、skills 等文件。Windows 开发者需要手动启用符号链接支持：
+
+1. **启用开发者模式**（设置 → 更新和安全 → 开发者选项），或
+2. 通过本地安全策略（`secpol.msc`）**授予 `SeCreateSymbolicLinkPrivilege` 权限**。
+3. **配置 Git** 以创建符号链接：
+   ```bash
+   git config --global core.symlinks true
+   ```
+4. 启用后重新克隆仓库（或执行 `pnpm skills:sync`）。
 
 ## 白名单跟踪规则
 
@@ -55,28 +62,4 @@ pnpm skills:check
 
 - `.agents/skills/.gitignore`
 - `.claude/skills/.gitignore`
-- `.claude/skills/<skill-name>/` 与 `.agents/skills/<skill-name>/` 的内容一致性
-
-## GitHub 分发
-
-仓库里的公共 skill 也可以通过
-[`vercel-labs/skills`](https://github.com/vercel-labs/skills) 进行安装和更新管理。
-
-有些面向最终用户的 skill 会单独维护在独立仓库里。
-例如，`cherry-chat-research` 现在维护在：
-
-- `https://github.com/ifastcc/cherry-chat-research`
-
-示例：
-
-```bash
-npx skills add ifastcc/cherry-chat-research --skill cherry-chat-research -a codex -a claude-code
-npx skills check
-npx skills update
-```
-
-仍然留在当前仓库内的 skills，则继续沿用现有维护方式：
-
-- 所有源码都在 `.agents/skills`
-- `public-skills.txt` 仍然是公共白名单
-- 每次改动后运行 `pnpm skills:sync` 和 `pnpm skills:check`
+- `.claude/skills/<skill-name>` 是指向 `.agents/skills/<skill-name>` 的有效符号链接
