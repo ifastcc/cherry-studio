@@ -94,8 +94,10 @@ describe('historyRoutes', () => {
 
   it('parses structured search queries with deduplication and sort controls', async () => {
     historyService.searchMessages.mockResolvedValue({
+      returnMode: 'query',
       hits: [],
       total: 0,
+      matchedMessageCount: 0,
       query: ''
     })
 
@@ -117,8 +119,40 @@ describe('historyRoutes', () => {
       order: 'desc',
       deduplicate: true,
       deduplicateBy: 'normalizedText',
+      returnMode: undefined,
       offset: undefined,
       limit: undefined
+    })
+  })
+
+  it('parses grouped search return modes', async () => {
+    historyService.searchMessages.mockResolvedValue({
+      returnMode: 'round',
+      groups: [],
+      total: 0,
+      matchedMessageCount: 0,
+      query: 'architecture'
+    })
+
+    const response = await fetch(`${baseUrl}/v1/history/search/messages?q=architecture&returnMode=round&limit=5`)
+
+    expect(response.status).toBe(200)
+    expect(historyService.searchMessages).toHaveBeenCalledWith('architecture', {
+      messageRange: undefined,
+      assistantId: undefined,
+      topicId: undefined,
+      role: undefined,
+      phrase: undefined,
+      allOf: undefined,
+      anyOf: undefined,
+      exclude: undefined,
+      sort: undefined,
+      order: undefined,
+      deduplicate: undefined,
+      deduplicateBy: undefined,
+      returnMode: 'round',
+      offset: undefined,
+      limit: 5
     })
   })
 
@@ -168,6 +202,14 @@ describe('historyRoutes', () => {
 
   it('returns 400 when search omits every positive query clause', async () => {
     const response = await fetch(`${baseUrl}/v1/history/search/messages?exclude=天气`)
+
+    expect(response.status).toBe(400)
+    const payload = await response.json()
+    expect(payload.error.code).toBe('invalid_parameters')
+  })
+
+  it('returns 400 for invalid grouped search modes', async () => {
+    const response = await fetch(`${baseUrl}/v1/history/search/messages?q=architecture&returnMode=all`)
 
     expect(response.status).toBe(400)
     const payload = await response.json()

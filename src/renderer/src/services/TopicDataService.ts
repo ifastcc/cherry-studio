@@ -26,6 +26,7 @@ import type {
   MessageBatchResult,
   MessageContextOptions,
   MessageContextResult,
+  MessageHit,
   MessageListOptions,
   MessageListResult,
   MessagePreviewRecord,
@@ -34,6 +35,9 @@ import type {
   PageInfo,
   SearchMessagesOptions,
   SearchMessagesResult,
+  SearchReturnMode,
+  SearchRoundGroup,
+  SearchTopicGroup,
   TimeRange,
   TopicListEntry,
   TopicListFilter,
@@ -88,6 +92,14 @@ interface TopicMessageRef {
   annotations: Map<string, MessageAnnotations>
 }
 
+interface SearchTopicContext {
+  meta: TopicMeta
+  messages: Message[]
+  annotations: Map<string, MessageAnnotations>
+  rounds: FlatRoundRef[]
+  blocksMap: Map<string, MessageBlock>
+}
+
 interface SearchMatchCriteria {
   query?: string
   phrase?: string
@@ -96,7 +108,7 @@ interface SearchMatchCriteria {
   exclude: string[]
 }
 
-type SearchHitDraft = SearchMessagesResult['hits'][number] & {
+interface SearchHitDraft extends MessageHit {
   relevanceScore: number
 }
 
@@ -379,13 +391,14 @@ class TopicDataService {
   }
 
   async searchMessages(query: string, options?: SearchMessagesOptions): Promise<SearchMessagesResult> {
+    const returnMode = options?.returnMode ?? 'query'
+    if (returnMode !== 'query' && options?.deduplicate) {
+      throw new Error('BAD_REQUEST: deduplicate is only supported when returnMode=query')
+    }
+
     const criteria = this.buildSearchCriteria(query, options)
     if (!criteria) {
-      return {
-        hits: [],
-        total: 0,
-        query
-      }
+      return this.emptySearchResult(query, returnMode)
     }
 
     const limit = options?.limit ?? 20
@@ -460,9 +473,26 @@ class TopicDataService {
       ? this.deduplicateSearchHits(hits, deduplicateBy)
       : hits.map((hit) => this.toSearchHit(hit))
 
+    if (returnMode === 'query') {
+      return {
+        returnMode,
+        hits: finalHits.slice(offset, offset + limit),
+        total: finalHits.length,
+        matchedMessageCount: finalHits.length,
+        query
+      }
+    }
+
+    const groups =
+      returnMode === 'round'
+        ? await this.buildRoundSearchGroups(finalHits)
+        : await this.buildTopicSearchGroups(finalHits)
+
     return {
-      hits: finalHits.slice(offset, offset + limit),
-      total: finalHits.length,
+      returnMode,
+      groups: groups.slice(offset, offset + limit),
+      total: groups.length,
+      matchedMessageCount: finalHits.length,
       query
     }
   }
@@ -1096,7 +1126,7 @@ class TopicDataService {
   private deduplicateSearchHits(
     hits: SearchHitDraft[],
     deduplicateBy: NonNullable<SearchMessagesOptions['deduplicateBy']>
-  ): SearchMessagesResult['hits'] {
+  ): MessageHit[] {
     const grouped = new Map<string, SearchHitDraft[]>()
     for (const hit of hits) {
       const key = this.buildDeduplicationKey(hit.mainText, hit.createdAt, deduplicateBy)
@@ -1109,7 +1139,7 @@ class TopicDataService {
     }
 
     const seen = new Set<string>()
-    const result: SearchMessagesResult['hits'] = []
+    const result: MessageHit[] = []
 
     for (const hit of hits) {
       const key = this.buildDeduplicationKey(hit.mainText, hit.createdAt, deduplicateBy)
@@ -1146,7 +1176,139 @@ class TopicDataService {
     return this.hashSearchContent(mainText, createdAt, mode)
   }
 
-  private toSearchHit(hit: SearchHitDraft): SearchMessagesResult['hits'][number] {
+  private emptySearchResult(query: string, returnMode: SearchReturnMode): SearchMessagesResult {
+    if (returnMode === 'query') {
+      return {
+        returnMode,
+        hits: [],
+        total: 0,
+        matchedMessageCount: 0,
+        query
+      }
+    }
+
+    return {
+      returnMode,
+      groups: [],
+      total: 0,
+      matchedMessageCount: 0,
+      query
+    }
+  }
+
+  private async buildRoundSearchGroups(hits: MessageHit[]): Promise<SearchRoundGroup[]> {
+    const groups: SearchRoundGroup[] = []
+    const groupsById = new Map<string, SearchRoundGroup>()
+    const topicContextCache = new Map<string, SearchTopicContext>()
+
+    for (const hit of hits) {
+      const groupId = hit.annotations.roundId
+        ? `round:${hit.topicId}:${hit.annotations.roundId}`
+        : `message:${hit.topicId}:${hit.messageId}`
+      const existing = groupsById.get(groupId)
+      if (existing) {
+        existing.matchedMessages.push(hit)
+        continue
+      }
+
+      const context = await this.getSearchTopicContext(hit.topicId, topicContextCache)
+      const groupMessages = this.resolveRoundSearchMessages(context, hit)
+      const records = groupMessages.map((message) =>
+        this.toMessageRecord(hit.topicId, message, context.blocksMap, context.annotations)
+      )
+
+      const group: SearchRoundGroup = {
+        groupType: 'round',
+        groupId,
+        topicId: hit.topicId,
+        topicName: context.meta.topic.name,
+        assistantName: context.meta.assistantName,
+        segmentId: hit.annotations.segmentId,
+        segmentIndex: hit.annotations.segmentIndex,
+        roundId: hit.annotations.roundId,
+        roundIndex: hit.annotations.roundIndex,
+        matchedMessages: [hit],
+        messages: records
+      }
+
+      groupsById.set(groupId, group)
+      groups.push(group)
+    }
+
+    return groups
+  }
+
+  private async buildTopicSearchGroups(hits: MessageHit[]): Promise<SearchTopicGroup[]> {
+    const groups: SearchTopicGroup[] = []
+    const groupsById = new Map<string, SearchTopicGroup>()
+    const topicContextCache = new Map<string, SearchTopicContext>()
+
+    for (const hit of hits) {
+      const existing = groupsById.get(hit.topicId)
+      if (existing) {
+        existing.matchedMessages.push(hit)
+        continue
+      }
+
+      const context = await this.getSearchTopicContext(hit.topicId, topicContextCache)
+      const records = context.messages.map((message) =>
+        this.toMessageRecord(hit.topicId, message, context.blocksMap, context.annotations)
+      )
+
+      const group: SearchTopicGroup = {
+        groupType: 'topic',
+        groupId: hit.topicId,
+        topicId: hit.topicId,
+        topicName: context.meta.topic.name,
+        assistantName: context.meta.assistantName,
+        matchedMessages: [hit],
+        messages: records
+      }
+
+      groupsById.set(hit.topicId, group)
+      groups.push(group)
+    }
+
+    return groups
+  }
+
+  private async getSearchTopicContext(
+    topicId: string,
+    cache: Map<string, SearchTopicContext>
+  ): Promise<SearchTopicContext> {
+    const existing = cache.get(topicId)
+    if (existing) {
+      return existing
+    }
+
+    const meta = this.findTopicMeta(topicId)
+    if (!meta) {
+      throw new Error(`NOT_FOUND: Topic not found: ${topicId}`)
+    }
+
+    const context = await this.getTopicConversationContext(topicId)
+    const blocksMap = await this.loadBlocksMap(context.messages.flatMap((message) => message.blocks || []))
+    const result: SearchTopicContext = {
+      meta,
+      ...context,
+      blocksMap
+    }
+    cache.set(topicId, result)
+    return result
+  }
+
+  private resolveRoundSearchMessages(context: SearchTopicContext, hit: MessageHit): Message[] {
+    if (hit.annotations.roundId) {
+      const round = context.rounds.find((entry) => entry.roundId === hit.annotations.roundId)
+      if (round) {
+        return [round.round.userMessage, ...round.round.assistantMessages]
+      }
+    }
+
+    return context.messages.filter((message) => message.id === hit.messageId)
+  }
+
+  private toSearchHit(hit: SearchHitDraft): MessageHit {
     return {
       topicId: hit.topicId,
       topicName: hit.topicName,

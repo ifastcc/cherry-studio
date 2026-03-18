@@ -169,9 +169,12 @@ export interface SearchMessagesOptions {
   order?: 'asc' | 'desc'
   deduplicate?: boolean
   deduplicateBy?: 'normalizedText' | 'normalizedTextAndTimestamp'
+  returnMode?: SearchReturnMode
   limit?: number
   offset?: number
 }
+
+export type SearchReturnMode = 'query' | 'round' | 'topic'
 
 export interface MessageHit {
   topicId: string
@@ -188,11 +191,47 @@ export interface MessageHit {
   annotations: MessageAnnotations
 }
 
-export interface SearchMessagesResult {
+export interface SearchRoundGroup {
+  groupType: 'round'
+  groupId: string
+  topicId: string
+  topicName: string
+  assistantName: string
+  segmentId: string
+  segmentIndex: number
+  roundId?: string
+  roundIndex?: number
+  matchedMessages: MessageHit[]
+  messages: MessageRecord[]
+}
+
+export interface SearchTopicGroup {
+  groupType: 'topic'
+  groupId: string
+  topicId: string
+  topicName: string
+  assistantName: string
+  matchedMessages: MessageHit[]
+  messages: MessageRecord[]
+}
+
+export interface SearchQueryMessagesResult {
+  returnMode: 'query'
   hits: MessageHit[]
   total: number
+  matchedMessageCount: number
   query: string
 }
+
+export interface SearchGroupedMessagesResult {
+  returnMode: 'round' | 'topic'
+  groups: Array<SearchRoundGroup | SearchTopicGroup>
+  total: number
+  matchedMessageCount: number
+  query: string
+}
+
+export type SearchMessagesResult = SearchQueryMessagesResult | SearchGroupedMessagesResult
 
 export interface WindowTopicDataService {
   listTopics: (filter?: TopicListFilter) => Promise<TopicListResult>

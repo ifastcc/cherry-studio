@@ -2660,6 +2660,15 @@
           },
           {
             "in": "query",
+            "name": "returnMode",
+            "description": "Controls whether the response returns matching messages only, expands to containing rounds, or expands to full matched topics.",
+            "schema": {
+              "type": "string",
+              "enum": ["query", "round", "topic"]
+            }
+          },
+          {
+            "in": "query",
             "name": "offset",
             "schema": {
               "type": "integer",

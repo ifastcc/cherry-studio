@@ -670,6 +670,12 @@ router.get('/messages/:messageId', async (req: Request, res: Response) => {
  *           type: string
  *           enum: [normalizedText, normalizedTextAndTimestamp]
  *       - in: query
+ *         name: returnMode
+ *         description: Controls whether the response returns matching messages only, expands to containing rounds, or expands to full matched topics.
+ *         schema:
+ *           type: string
+ *           enum: [query, round, topic]
+ *       - in: query
  *         name: offset
  *         schema:
  *           type: integer
@@ -718,6 +724,7 @@ router.get('/search/messages', async (req: Request, res: Response) => {
         'normalizedText',
         'normalizedTextAndTimestamp'
       ]),
+      returnMode: parseEnumQuery(req.query.returnMode, 'returnMode', ['query', 'round', 'topic']),
       offset: parseIntegerQuery(req.query.offset, 'offset', { min: 0 }),
       limit: parseIntegerQuery(req.query.limit, 'limit', { min: 1 })
     })

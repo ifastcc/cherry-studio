@@ -334,6 +334,11 @@ describe('TopicDataService', () => {
       }
     })
 
+    expect(result.returnMode).toBe('query')
+    if (result.returnMode !== 'query') {
+      throw new Error('Expected query search result')
+    }
+
     expect(result.hits).toHaveLength(1)
     expect(result.hits[0]).toMatchObject({
       messageId: 'a3',
@@ -409,6 +414,11 @@ describe('TopicDataService', () => {
       order: 'desc'
     })
 
+    expect(result.returnMode).toBe('query')
+    if (result.returnMode !== 'query') {
+      throw new Error('Expected query search result')
+    }
+
     expect(result.hits).toHaveLength(1)
     expect(result.hits[0]).toMatchObject({
       messageId: 'a4',
@@ -440,7 +450,76 @@ describe('TopicDataService', () => {
       order: 'desc'
     })
 
+    expect(result.returnMode).toBe('query')
+    if (result.returnMode !== 'query') {
+      throw new Error('Expected query search result')
+    }
+
     expect(result.hits.slice(0, 2).map((hit) => hit.messageId)).toEqual(['a4', 'a3'])
     expect(result.hits[0].mainText).toBe('Final follow-up reply')
+  })
+
+  it('can expand search hits into round groups', async () => {
+    const result = await topicDataService.searchMessages('final follow-up', {
+      returnMode: 'round',
+      sort: 'createdAt',
+      order: 'desc'
+    })
+
+    expect(result.returnMode).toBe('round')
+    if (result.returnMode !== 'round') {
+      throw new Error('Expected round-grouped search result')
+    }
+
+    expect(result.total).toBe(2)
+    expect(result.matchedMessageCount).toBe(2)
+    expect(result.groups.map((group) => group.groupId)).toEqual(['round:topic-2:u3', 'round:topic-1:u2'])
+    expect(result.groups[0]).toMatchObject({
+      topicId: topicTwo.id,
+      topicName: topicTwo.name,
+      roundId: 'u3',
+      matchedMessages: [expect.objectContaining({ messageId: 'a4' })]
+    })
+    expect(result.groups[0].messages.map((message) => message.messageId)).toEqual(['u3', 'a4'])
+    expect(result.groups[1].messages.map((message) => message.messageId)).toEqual(['u2', 'a3'])
+  })
+
+  it('can expand search hits into full topic groups', async () => {
+    const result = await topicDataService.searchMessages('final follow-up', {
+      returnMode: 'topic',
+      sort: 'createdAt',
+      order: 'desc'
+    })
+
+    expect(result.returnMode).toBe('topic')
+    if (result.returnMode !== 'topic') {
+      throw new Error('Expected topic-grouped search result')
+    }
+
+    expect(result.total).toBe(2)
+    expect(result.matchedMessageCount).toBe(2)
+    expect(result.groups[0]).toMatchObject({
+      topicId: topicTwo.id,
+      matchedMessages: [expect.objectContaining({ messageId: 'a4' })]
+    })
+    expect(result.groups[0].messages.map((message) => message.messageId)).toEqual(['u3', 'a4'])
+    expect(result.groups[1].matchedMessages.map((message) => message.messageId)).toEqual(['a3'])
+    expect(result.groups[1].messages.map((message) => message.messageId)).toEqual([
+      'u1',
+      'a1',
+      'a2',
+      'a-orphan',
+      'u2',
+      'a3'
+    ])
+  })
+
+  it('rejects deduplication when search results are expanded into grouped context', async () => {
+    await expect(
+      topicDataService.searchMessages('follow-up', {
+        returnMode: 'round',
+        deduplicate: true
+      })
+    ).rejects.toThrow('BAD_REQUEST: deduplicate is only supported when returnMode=query')
   })
 })
