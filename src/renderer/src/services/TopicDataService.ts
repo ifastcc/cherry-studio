@@ -130,6 +130,11 @@ class TopicDataService {
       candidates = candidates.filter((meta) => meta.assistantId === filter.assistantId)
     }
 
+    if (filter?.assistantName) {
+      const assistantName = filter.assistantName.trim().toLowerCase()
+      candidates = candidates.filter((meta) => meta.assistantName.trim().toLowerCase() === assistantName)
+    }
+
     const topicIds = candidates.map((meta) => meta.topic.id)
     const topicDataList = await db.topics.bulkGet(topicIds)
     const contexts = await Promise.all(

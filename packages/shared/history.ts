@@ -7,6 +7,7 @@ export interface TopicListFilter {
   topicCreatedRange?: TimeRange
   topicActivityRange?: TimeRange
   assistantId?: string
+  assistantName?: string
   keyword?: string
   minMessageCount?: number
   sortBy?: 'createdAt' | 'updatedAt' | 'lastMessageAt' | 'messageCount'

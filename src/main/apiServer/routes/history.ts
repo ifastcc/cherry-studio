@@ -186,6 +186,11 @@ function handleHistoryError(error: unknown, res: Response) {
  *         schema:
  *           type: string
  *       - in: query
+ *         name: assistantName
+ *         description: Case-insensitive exact match on assistant name.
+ *         schema:
+ *           type: string
+ *       - in: query
  *         name: keyword
  *         schema:
  *           type: string
@@ -236,6 +241,7 @@ router.get('/topics', async (req: Request, res: Response) => {
         toKey: 'topicActivityTo'
       }),
       assistantId: typeof req.query.assistantId === 'string' ? req.query.assistantId : undefined,
+      assistantName: typeof req.query.assistantName === 'string' ? req.query.assistantName : undefined,
       keyword: typeof req.query.keyword === 'string' ? req.query.keyword : undefined,
       minMessageCount: parseIntegerQuery(req.query.minMessageCount, 'minMessageCount', { min: 0 }),
       sortBy: parseEnumQuery(req.query.sortBy, 'sortBy', ['createdAt', 'updatedAt', 'lastMessageAt', 'messageCount']),

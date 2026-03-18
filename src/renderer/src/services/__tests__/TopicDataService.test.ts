@@ -237,6 +237,20 @@ describe('TopicDataService', () => {
     })
   })
 
+  it('filters topics by assistant name with case-insensitive exact matching', async () => {
+    const result = await topicDataService.listTopics({
+      assistantName: 'architect'
+    })
+
+    expect(result.total).toBe(2)
+
+    const noMatch = await topicDataService.listTopics({
+      assistantName: 'arch'
+    })
+
+    expect(noMatch.total).toBe(0)
+  })
+
   it('keeps stable segment and round annotations on list responses', async () => {
     const result = await topicDataService.listMessages(topic.id, { segmentId: 'after:clear-1' })
     expect(result.total).toBe(3)

@@ -72,6 +72,29 @@ describe('historyRoutes', () => {
     expect(payload.error.code).toBe('invalid_parameters')
   })
 
+  it('parses assistant name topic filters', async () => {
+    historyService.listTopics.mockResolvedValue({
+      topics: [],
+      total: 0
+    })
+
+    const response = await fetch(`${baseUrl}/v1/history/topics?assistantName=think_archive&limit=50`)
+
+    expect(response.status).toBe(200)
+    expect(historyService.listTopics).toHaveBeenCalledWith({
+      topicCreatedRange: undefined,
+      topicActivityRange: undefined,
+      assistantId: undefined,
+      assistantName: 'think_archive',
+      keyword: undefined,
+      minMessageCount: undefined,
+      sortBy: undefined,
+      sortOrder: undefined,
+      offset: undefined,
+      limit: 50
+    })
+  })
+
   it('returns 404 for missing topics', async () => {
     historyService.getTopicMeta.mockRejectedValue(new TopicDataNotFoundError('Topic not found: topic-404'))
 

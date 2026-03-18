@@ -2138,6 +2138,14 @@
           },
           {
             "in": "query",
+            "name": "assistantName",
+            "description": "Case-insensitive exact match on assistant name.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
             "name": "keyword",
             "schema": {
               "type": "string"
