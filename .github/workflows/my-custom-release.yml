@@ -102,6 +102,9 @@ jobs:
           declare -a FORK_OWNED_PATHS=(
             .github/workflows
             electron-builder.yml
+            src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
+            src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
+            src/renderer/src/pages/settings/DataSettings/TopicSyncText.ts
           )
 
           git config user.name "github-actions[bot]"
