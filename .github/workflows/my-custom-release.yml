@@ -102,7 +102,6 @@ jobs:
           declare -a FORK_OWNED_PATHS=(
             .github/workflows
             electron-builder.yml
-            src/renderer/src/pages/settings/DataSettings/BasicDataSettings.tsx
             src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
             src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
             src/renderer/src/pages/settings/DataSettings/TopicSyncText.ts
@@ -153,11 +152,15 @@ jobs:
             git add "${FORK_OWNED_PATHS[@]}"
             git restore --source=HEAD --staged --worktree "${FORK_OWNED_PATHS[@]}"
 
-            if git diff --name-only --diff-filter=U | grep -q .; then
-              echo "::error::Merge conflicts remain after preserving fork-owned paths while syncing ${TARGET_TAG}."
-              git diff --name-only --diff-filter=U
-              git merge --abort || true
-              exit 1
+            REMAINING_CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+            if [ -n "$REMAINING_CONFLICTS" ]; then
+              echo "Resolving remaining conflicts with upstream (--theirs):"
+              while IFS= read -r remaining_file; do
+                [ -z "$remaining_file" ] && continue
+                echo "  --theirs: ${remaining_file}"
+                git checkout --theirs -- "$remaining_file"
+                git add "$remaining_file"
+              done <<< "$REMAINING_CONFLICTS"
             fi
 
             git commit --allow-empty -m "chore: sync upstream ${TARGET_TAG} (preserve fork paths)"
