@@ -73,6 +73,23 @@ interface SyncProgressState {
   failed: number
 }
 
+interface DeletedTopicEntry {
+  topicId: string
+  name: string
+  assistantId: string | null
+  assistantName: string
+  createdAt: number
+  updatedAt: number
+  deletedAt: number
+  revision: number
+}
+
+interface RestoreResultEntry {
+  total: number
+  applied: number
+  failed: number
+}
+
 interface SyncRuntimeState {
   configured: boolean
   server: string
@@ -92,6 +109,8 @@ interface SyncRuntimeState {
   lastFailures: SyncFailureItem[]
   syncProgress: SyncProgressState
   lastError: string | null
+  deletedTopics: DeletedTopicEntry[]
+  restoreResult: RestoreResultEntry | null
 }
 
 const DEFAULT_SYNC_RUNTIME_STATE: SyncRuntimeState = {
@@ -117,7 +136,9 @@ const DEFAULT_SYNC_RUNTIME_STATE: SyncRuntimeState = {
     processed: 0,
     failed: 0
   },
-  lastError: null
+  lastError: null,
+  deletedTopics: [],
+  restoreResult: null
 }
 
 interface ConnectivityProbeResult {
@@ -2488,8 +2509,8 @@ async function start() {
 
       // 从 deletedTopics 缓存中移除已恢复的 topic
       const currentRuntime = getSyncRuntimeState()
-      const remainingDeleted = Array.isArray((currentRuntime as any).deletedTopics)
-        ? (currentRuntime as any).deletedTopics.filter((t: any) => !restoredIds.includes(t.topicId))
+      const remainingDeleted = Array.isArray(currentRuntime.deletedTopics)
+        ? currentRuntime.deletedTopics.filter((t) => !restoredIds.includes(t.topicId))
         : []
 
       updateSyncRuntimeState({
