@@ -148,6 +148,33 @@ export interface TopicSyncText {
     stale: string
     failed: string
   }
+  recovery: {
+    section: string
+    loadList: string
+    loading: string
+    restoreSelected: string
+    selectAll: string
+    deselectAll: string
+    empty: string
+    emptyHint: string
+    groupUnknown: string
+    deletedAt: string
+    createdAt: string
+    revision: string
+    selected: (count: number) => string
+    resultSuccess: (applied: number, total: number) => string
+    resultPartial: (applied: number, failed: number) => string
+    resultFailed: string
+    confirmTitle: string
+    confirmContent: (count: number) => string
+    confirmOk: string
+    toastFetched: (count: number) => string
+    toastRestoring: string
+    toastRestored: string
+    sortByDeletedAt: string
+    sortByName: string
+    filterPlaceholder: string
+  }
   failedItemsCount: (count: number) => string
   pendingConflictsMessage: (count: number) => string
   pendingConflictsCount: (count: number) => string
@@ -304,6 +331,33 @@ const EN_US: TopicSyncText = {
     noop: 'noop',
     stale: 'stale',
     failed: 'failed'
+  },
+  recovery: {
+    section: 'Recover Deleted Topics',
+    loadList: 'Load Deleted Topics',
+    loading: 'Loading...',
+    restoreSelected: 'Restore Selected',
+    selectAll: 'Select All',
+    deselectAll: 'Deselect All',
+    empty: 'No deleted topics on server.',
+    emptyHint: 'Topics deleted within 30 days can be recovered here.',
+    groupUnknown: 'Unknown Assistant',
+    deletedAt: 'Deleted',
+    createdAt: 'Created',
+    revision: 'Rev',
+    selected: (count) => `${count} selected`,
+    resultSuccess: (applied, total) => `Restored ${applied}/${total} topics successfully.`,
+    resultPartial: (applied, failed) => `Restored ${applied}, ${failed} failed.`,
+    resultFailed: 'Restore failed.',
+    confirmTitle: 'Restore Selected Topics?',
+    confirmContent: (count) => `This will restore ${count} topic(s) from server and pull them back to local.`,
+    confirmOk: 'Restore',
+    toastFetched: (count) => `Found ${count} deleted topic(s) on server.`,
+    toastRestoring: 'Restoring selected topics...',
+    toastRestored: 'Restore completed.',
+    sortByDeletedAt: 'Sort by Deleted Time',
+    sortByName: 'Sort by Name',
+    filterPlaceholder: 'Filter by name or assistant...'
   },
   failedItemsCount: (count) => `${count} failed`,
   pendingConflictsMessage: (count) => `${count} pending conflicts`,
@@ -462,6 +516,33 @@ const ZH_CN: TopicSyncText = {
     stale: '过期',
     failed: '失败'
   },
+  recovery: {
+    section: '恢复已删除话题',
+    loadList: '加载已删除列表',
+    loading: '加载中...',
+    restoreSelected: '恢复选中',
+    selectAll: '全选',
+    deselectAll: '取消全选',
+    empty: '服务器上没有已删除的话题。',
+    emptyHint: '30 天内删除的话题可在此恢复。',
+    groupUnknown: '未知助手',
+    deletedAt: '删除于',
+    createdAt: '创建于',
+    revision: '版本',
+    selected: (count) => `已选 ${count} 条`,
+    resultSuccess: (applied, total) => `成功恢复 ${applied}/${total} 条话题。`,
+    resultPartial: (applied, failed) => `已恢复 ${applied} 条，${failed} 条失败。`,
+    resultFailed: '恢复失败。',
+    confirmTitle: '确认恢复选中话题？',
+    confirmContent: (count) => `将从服务器恢复 ${count} 条话题并拉取到本地。`,
+    confirmOk: '恢复',
+    toastFetched: (count) => `在服务器上找到 ${count} 条已删除话题。`,
+    toastRestoring: '正在恢复选中话题...',
+    toastRestored: '恢复完成。',
+    sortByDeletedAt: '按删除时间',
+    sortByName: '按名称',
+    filterPlaceholder: '按名称或助手筛选...'
+  },
   failedItemsCount: (count) => `${count} 条失败`,
   pendingConflictsMessage: (count) => `${count} 条待处理冲突`,
   pendingConflictsCount: (count) => `共 ${count} 条`,
@@ -618,6 +699,33 @@ const ZH_TW: TopicSyncText = {
     noop: '無操作',
     stale: '過期',
     failed: '失敗'
+  },
+  recovery: {
+    section: '恢復已刪除話題',
+    loadList: '載入已刪除列表',
+    loading: '載入中...',
+    restoreSelected: '恢復選取',
+    selectAll: '全選',
+    deselectAll: '取消全選',
+    empty: '伺服器上沒有已刪除的話題。',
+    emptyHint: '30 天內刪除的話題可在此恢復。',
+    groupUnknown: '未知助手',
+    deletedAt: '刪除於',
+    createdAt: '建立於',
+    revision: '版本',
+    selected: (count) => `已選 ${count} 筆`,
+    resultSuccess: (applied, total) => `成功恢復 ${applied}/${total} 筆話題。`,
+    resultPartial: (applied, failed) => `已恢復 ${applied} 筆，${failed} 筆失敗。`,
+    resultFailed: '恢復失敗。',
+    confirmTitle: '確認恢復選取話題？',
+    confirmContent: (count) => `將從伺服器恢復 ${count} 筆話題並拉取到本機。`,
+    confirmOk: '恢復',
+    toastFetched: (count) => `在伺服器上找到 ${count} 筆已刪除話題。`,
+    toastRestoring: '正在恢復選取話題...',
+    toastRestored: '恢復完成。',
+    sortByDeletedAt: '按刪除時間',
+    sortByName: '按名稱',
+    filterPlaceholder: '按名稱或助手篩選...'
   },
   failedItemsCount: (count) => `${count} 筆失敗`,
   pendingConflictsMessage: (count) => `${count} 筆待處理衝突`,

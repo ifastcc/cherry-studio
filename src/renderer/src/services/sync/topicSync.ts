@@ -2346,6 +2346,172 @@ async function start() {
     }
   })
 
+  // 拉取服务端已删除 topic 列表
+  window.addEventListener('cherry-sync-fetch-deleted', async () => {
+    const { server, token } = await getConfig()
+    if (!server) {
+      updateSyncRuntimeState({ lastError: 'missing_server' })
+      return
+    }
+
+    try {
+      const resp = await fetchWithTimeout(`${server}/api/topics/deleted`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      const text = await resp.text()
+      if (!resp.ok) {
+        logger.error(`GET /api/topics/deleted failed: ${resp.status}`)
+        updateSyncRuntimeState({ lastError: `fetch_deleted_http_${resp.status}` })
+        return
+      }
+
+      const decoded = text ? JSON.parse(text) : null
+      const topics = Array.isArray(decoded?.topics) ? decoded.topics : []
+      updateSyncRuntimeState({ deletedTopics: topics, restoreResult: null })
+      logger.info(`Fetched ${topics.length} deleted topics from server`)
+    } catch (e) {
+      logger.error('Fetch deleted topics error', e instanceof Error ? e : new Error(String(e)))
+      updateSyncRuntimeState({ lastError: e instanceof Error ? e.message : 'fetch_deleted_error' })
+    }
+  })
+
+  // 从服务端恢复选中的已删除 topic
+  window.addEventListener('cherry-sync-restore-topics', async (event) => {
+    const detail = (event as CustomEvent<{ topicIds?: string[] }>).detail
+    const topicIds = Array.isArray(detail?.topicIds) ? detail.topicIds.filter((id) => typeof id === 'string' && id) : []
+    if (topicIds.length === 0) return
+
+    if (isSyncRunning) {
+      logger.verbose('Restore skipped: sync loop is running.')
+      return
+    }
+
+    const { server, token } = await getConfig()
+    if (!server) {
+      updateSyncRuntimeState({ lastError: 'missing_server' })
+      return
+    }
+
+    isSyncRunning = true
+    updateSyncRuntimeState({ running: true, lastError: null })
+
+    try {
+      // 1. 调用 restore-batch 在服务端恢复 tombstone
+      const restoreResp = await fetchWithTimeout(`${server}/api/topics/restore-batch`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ topicIds })
+      })
+
+      const restoreText = await restoreResp.text()
+      if (!restoreResp.ok) {
+        logger.error(`POST /api/topics/restore-batch failed: ${restoreResp.status} ${shortenResponseText(restoreText)}`)
+        updateSyncRuntimeState({
+          restoreResult: { total: topicIds.length, applied: 0, failed: topicIds.length },
+          lastError: `restore_http_${restoreResp.status}`
+        })
+        return
+      }
+
+      const restoreDecoded = restoreText ? JSON.parse(restoreText) : null
+      const restoreResults = Array.isArray(restoreDecoded?.results) ? restoreDecoded.results : []
+      const restoredIds: string[] = []
+      let restoreFailed = 0
+      for (const item of restoreResults) {
+        if (
+          isRecord(item) &&
+          (item.status === 'applied' || item.status === 'noop') &&
+          typeof item.topicId === 'string'
+        ) {
+          restoredIds.push(item.topicId)
+        } else {
+          restoreFailed++
+        }
+      }
+
+      if (restoredIds.length === 0) {
+        updateSyncRuntimeState({
+          restoreResult: { total: topicIds.length, applied: 0, failed: restoreFailed },
+          lastError: restoreFailed > 0 ? 'all_restore_failed' : null
+        })
+        return
+      }
+
+      // 2. 拉取恢复后的 topic 数据写入本地
+      const fetched = await fetchTopicsBatch(server, token, restoredIds)
+      const assistants = cloneAssistantsForUpdate()
+      const syncedRevisions = loadSyncedRevisions(server)
+      const dirtyTopicIds = loadDirtyTopicIds(server)
+      let assistantsChanged = false
+      let appliedLocal = 0
+
+      for (const topicId of restoredIds) {
+        const topicData = fetched.get(topicId)
+        if (!topicData) continue
+
+        const resolvedAssistant = resolveAssistantId(assistants, topicData)
+        if (resolvedAssistant.createdAssistant) assistantsChanged = true
+
+        const normalized = normalizeIncomingTopic(topicData, resolvedAssistant.assistantId)
+        await applyUpsertToDb(topicId, normalized.messages, normalized.blocks)
+
+        if (upsertTopicMetaInAssistants(assistants, resolvedAssistant.assistantId, normalized.topicMeta)) {
+          assistantsChanged = true
+        }
+
+        // 更新 revision 并从 dirty 移除（刚恢复的 topic 不应立刻被推送删除）
+        const restoreItem = restoreResults.find((r: any) => r.topicId === topicId)
+        if (restoreItem?.revision != null) {
+          syncedRevisions.set(topicId, Number(restoreItem.revision))
+        }
+        dirtyTopicIds.delete(topicId)
+        appliedLocal++
+      }
+
+      if (assistantsChanged) {
+        try {
+          store.dispatch(updateAssistants(assistants))
+        } catch (dispatchErr) {
+          logger.error(
+            'Failed to dispatch updateAssistants after restore',
+            dispatchErr instanceof Error ? dispatchErr : new Error(String(dispatchErr))
+          )
+        }
+      }
+
+      saveSyncedRevisions(server, syncedRevisions)
+      saveDirtyTopicIds(server, dirtyTopicIds)
+
+      // 从 deletedTopics 缓存中移除已恢复的 topic
+      const currentRuntime = getSyncRuntimeState()
+      const remainingDeleted = Array.isArray((currentRuntime as any).deletedTopics)
+        ? (currentRuntime as any).deletedTopics.filter((t: any) => !restoredIds.includes(t.topicId))
+        : []
+
+      updateSyncRuntimeState({
+        deletedTopics: remainingDeleted,
+        restoreResult: { total: topicIds.length, applied: appliedLocal, failed: restoreFailed },
+        lastError: restoreFailed > 0 ? `${restoreFailed} topic(s) failed to restore` : null
+      })
+
+      logger.info(`Restore completed: ${appliedLocal}/${topicIds.length} applied, ${restoreFailed} failed`)
+    } catch (e) {
+      const error = e instanceof Error ? e : new Error(String(e))
+      logger.error('Restore topics error', error)
+      updateSyncRuntimeState({
+        restoreResult: { total: topicIds.length, applied: 0, failed: topicIds.length },
+        lastError: error.message
+      })
+    } finally {
+      isSyncRunning = false
+      updateSyncRuntimeState({ running: false })
+    }
+  })
+
   // 手动处理冲突并回写（按指定策略）
   window.addEventListener('cherry-sync-resolve-conflicts', async (event) => {
     if (isSyncRunning) {

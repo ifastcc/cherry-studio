@@ -1,10 +1,10 @@
-import { ReloadOutlined, SyncOutlined } from '@ant-design/icons'
+import { DeleteOutlined, ReloadOutlined, SyncOutlined, UndoOutlined } from '@ant-design/icons'
 import { HStack } from '@renderer/components/Layout'
 import { useTheme } from '@renderer/context/ThemeProvider'
-import { Alert, Button, Collapse, Input, Select, Tag } from 'antd'
+import { Alert, Button, Checkbox, Collapse, Empty, Input, Select, Tag } from 'antd'
 import dayjs from 'dayjs'
 import type { FC } from 'react'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import styled from 'styled-components'
 
 import { SettingDivider, SettingGroup, SettingHelpText, SettingRow, SettingRowTitle, SettingTitle } from '..'
@@ -70,6 +70,23 @@ interface SyncProgressState {
   failed: number
 }
 
+interface DeletedTopicItem {
+  topicId: string
+  name: string
+  assistantId: string | null
+  assistantName: string
+  createdAt: number
+  updatedAt: number
+  deletedAt: number
+  revision: number
+}
+
+interface RestoreResult {
+  total: number
+  applied: number
+  failed: number
+}
+
 interface SyncRuntimeState {
   configured: boolean
   server: string
@@ -91,6 +108,8 @@ interface SyncRuntimeState {
   lastFailures: SyncFailureItem[]
   syncProgress: SyncProgressState
   lastError: string | null
+  deletedTopics: DeletedTopicItem[]
+  restoreResult: RestoreResult | null
 }
 
 const DEFAULT_RUNTIME_STATE: SyncRuntimeState = {
@@ -118,7 +137,9 @@ const DEFAULT_RUNTIME_STATE: SyncRuntimeState = {
     processed: 0,
     failed: 0
   },
-  lastError: null
+  lastError: null,
+  deletedTopics: [],
+  restoreResult: null
 }
 
 const Section = styled.div`
@@ -174,6 +195,68 @@ const PreviewText = styled.pre`
   color: var(--color-text-2);
   white-space: pre-wrap;
   word-break: break-word;
+`
+
+const RecoveryList = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 400px;
+  overflow-y: auto;
+  padding: 4px 0;
+`
+
+const RecoveryGroupHeader = styled.div`
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-2);
+  padding: 6px 8px 2px;
+  position: sticky;
+  top: 0;
+  background: var(--color-background);
+  z-index: 1;
+`
+
+const RecoveryItem = styled.label`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--list-item-border-radius);
+  cursor: pointer;
+  transition: background 0.15s;
+  &:hover {
+    background: var(--color-background-soft);
+  }
+`
+
+const RecoveryItemInfo = styled.div`
+  flex: 1;
+  min-width: 0;
+`
+
+const RecoveryItemName = styled.div`
+  font-size: 13px;
+  color: var(--color-text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+`
+
+const RecoveryItemMeta = styled.div`
+  font-size: 11px;
+  color: var(--color-text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+`
+
+const RecoveryToolbar = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
 `
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -262,7 +345,9 @@ function parseRuntimeState(raw: string | null): SyncRuntimeState {
             ...DEFAULT_RUNTIME_STATE.syncProgress,
             ...parsed.syncProgress
           }
-        : { ...DEFAULT_RUNTIME_STATE.syncProgress }
+        : { ...DEFAULT_RUNTIME_STATE.syncProgress },
+      deletedTopics: Array.isArray(parsed.deletedTopics) ? parsed.deletedTopics : [],
+      restoreResult: isRecord(parsed.restoreResult) ? (parsed.restoreResult as RestoreResult) : null
     }
   } catch {
     return { ...DEFAULT_RUNTIME_STATE }
@@ -365,6 +450,14 @@ const TopicSyncSettings: FC = () => {
   const [runtime, setRuntime] = useState<SyncRuntimeState>(DEFAULT_RUNTIME_STATE)
   const text = useMemo(() => getTopicSyncText(language), [language])
 
+  // ── Recovery state ──
+  type RecoverySortKey = 'deletedAt' | 'name'
+  const [recoveryLoaded, setRecoveryLoaded] = useState(false)
+  const [recoveryLoading, setRecoveryLoading] = useState(false)
+  const [selectedTopicIds, setSelectedTopicIds] = useState<Set<string>>(new Set())
+  const [recoverySort, setRecoverySort] = useState<RecoverySortKey>('deletedAt')
+  const [recoveryFilter, setRecoveryFilter] = useState('')
+
   useEffect(() => {
     setServer(localStorage.getItem(SYNC_SERVER_KEY) || '')
     setToken(localStorage.getItem(SYNC_TOKEN_KEY) || '')
@@ -373,7 +466,13 @@ const TopicSyncSettings: FC = () => {
 
     const handleRuntimeUpdate = () => {
       setLanguage(localStorage.getItem('language') || navigator.language)
-      setRuntime(parseRuntimeState(localStorage.getItem(SYNC_RUNTIME_KEY)))
+      const next = parseRuntimeState(localStorage.getItem(SYNC_RUNTIME_KEY))
+      setRuntime(next)
+      // 如果 loading 后 deletedTopics 已填充，标记为 loaded
+      if (next.deletedTopics.length > 0 || next.restoreResult != null) {
+        setRecoveryLoaded(true)
+        setRecoveryLoading(false)
+      }
     }
     const timer = setInterval(handleRuntimeUpdate, 1500)
     window.addEventListener('cherry-sync-runtime', handleRuntimeUpdate as EventListener)
@@ -527,6 +626,93 @@ const TopicSyncSettings: FC = () => {
       }
     })
   }
+
+  // ── Recovery handlers ──
+  const deletedTopics: DeletedTopicItem[] = useMemo(() => {
+    return Array.isArray(runtime.deletedTopics) ? runtime.deletedTopics : []
+  }, [runtime.deletedTopics])
+
+  const filteredTopics = useMemo(() => {
+    let items = [...deletedTopics]
+    if (recoveryFilter.trim()) {
+      const q = recoveryFilter.trim().toLowerCase()
+      items = items.filter(
+        (t) =>
+          (t.name || '').toLowerCase().includes(q) ||
+          (t.assistantName || '').toLowerCase().includes(q) ||
+          t.topicId.toLowerCase().includes(q)
+      )
+    }
+    if (recoverySort === 'name') {
+      items.sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+    } else {
+      items.sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0))
+    }
+    return items
+  }, [deletedTopics, recoveryFilter, recoverySort])
+
+  const groupedTopics = useMemo(() => {
+    const groups = new Map<string, { label: string; items: DeletedTopicItem[] }>()
+    for (const topic of filteredTopics) {
+      const key = topic.assistantName || topic.assistantId || '__unknown__'
+      const label = topic.assistantName || text.recovery.groupUnknown
+      if (!groups.has(key)) {
+        groups.set(key, { label, items: [] })
+      }
+      groups.get(key)!.items.push(topic)
+    }
+    return [...groups.values()]
+  }, [filteredTopics, text.recovery.groupUnknown])
+
+  const toggleSelect = useCallback((topicId: string) => {
+    setSelectedTopicIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(topicId)) next.delete(topicId)
+      else next.add(topicId)
+      return next
+    })
+  }, [])
+
+  const toggleSelectAll = useCallback(() => {
+    const allFilteredIds = filteredTopics.map((t) => t.topicId)
+    setSelectedTopicIds((prev) => {
+      const allSelected = allFilteredIds.every((id) => prev.has(id))
+      if (allSelected) return new Set()
+      return new Set(allFilteredIds)
+    })
+  }, [filteredTopics])
+
+  const allFilteredSelected = useMemo(() => {
+    if (filteredTopics.length === 0) return false
+    return filteredTopics.every((t) => selectedTopicIds.has(t.topicId))
+  }, [filteredTopics, selectedTopicIds])
+
+  const triggerFetchDeleted = () => {
+    setRecoveryLoading(true)
+    setSelectedTopicIds(new Set())
+    window.dispatchEvent(new Event('cherry-sync-fetch-deleted'))
+    // 结果通过 runtime state 回传，handleRuntimeUpdate 会更新
+    // 设置一个超时保护
+    setTimeout(() => setRecoveryLoading(false), 15_000)
+  }
+
+  const triggerRestore = () => {
+    const ids = [...selectedTopicIds]
+    if (ids.length === 0) return
+    window.modal.confirm({
+      centered: true,
+      title: text.recovery.confirmTitle,
+      content: text.recovery.confirmContent(ids.length),
+      okText: text.recovery.confirmOk,
+      onOk: () => {
+        window.toast.success(text.recovery.toastRestoring)
+        window.dispatchEvent(new CustomEvent('cherry-sync-restore-topics', { detail: { topicIds: ids } }))
+        setSelectedTopicIds(new Set())
+      }
+    })
+  }
+
+  const restoreResult = runtime.restoreResult as RestoreResult | null
 
   const copyDebugInfo = async () => {
     const debugInfo = JSON.stringify(
@@ -819,6 +1005,116 @@ const TopicSyncSettings: FC = () => {
             </SummaryCard>
           ))}
         </SummaryGrid>
+      </Section>
+
+      <SettingDivider />
+
+      <Section>
+        <SectionTitle>
+          <HStack gap="8px" alignItems="center">
+            <UndoOutlined />
+            {text.recovery.section}
+          </HStack>
+        </SectionTitle>
+        <SettingRow>
+          <SettingHelpText>{text.recovery.emptyHint}</SettingHelpText>
+        </SettingRow>
+
+        <RecoveryToolbar>
+          <Button
+            icon={<DeleteOutlined />}
+            loading={recoveryLoading}
+            disabled={!runtime.configured || runtime.running}
+            onClick={triggerFetchDeleted}>
+            {recoveryLoading ? text.recovery.loading : text.recovery.loadList}
+          </Button>
+          {recoveryLoaded && deletedTopics.length > 0 && (
+            <>
+              <Input
+                placeholder={text.recovery.filterPlaceholder}
+                value={recoveryFilter}
+                onChange={(e) => setRecoveryFilter(e.target.value)}
+                allowClear
+                style={{ width: 220 }}
+                size="small"
+              />
+              <Select
+                value={recoverySort}
+                onChange={(v) => setRecoverySort(v as RecoverySortKey)}
+                size="small"
+                style={{ width: 140 }}
+                options={[
+                  { value: 'deletedAt', label: text.recovery.sortByDeletedAt },
+                  { value: 'name', label: text.recovery.sortByName }
+                ]}
+              />
+            </>
+          )}
+        </RecoveryToolbar>
+
+        {recoveryLoaded && deletedTopics.length === 0 && (
+          <Empty description={text.recovery.empty} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        )}
+
+        {recoveryLoaded && filteredTopics.length > 0 && (
+          <>
+            <RecoveryToolbar>
+              <Checkbox checked={allFilteredSelected} onChange={toggleSelectAll}>
+                {allFilteredSelected ? text.recovery.deselectAll : text.recovery.selectAll}
+              </Checkbox>
+              <span style={{ fontSize: 12, color: 'var(--color-text-3)' }}>
+                {text.recovery.selected(selectedTopicIds.size)} / {filteredTopics.length}
+              </span>
+              <div style={{ flex: 1 }} />
+              <Button
+                type="primary"
+                size="small"
+                disabled={selectedTopicIds.size === 0 || runtime.running}
+                onClick={triggerRestore}>
+                {text.recovery.restoreSelected}
+              </Button>
+            </RecoveryToolbar>
+
+            <RecoveryList>
+              {groupedTopics.map((group) => (
+                <div key={group.label}>
+                  <RecoveryGroupHeader>{group.label}</RecoveryGroupHeader>
+                  {group.items.map((topic) => (
+                    <RecoveryItem key={topic.topicId} onClick={() => toggleSelect(topic.topicId)}>
+                      <Checkbox checked={selectedTopicIds.has(topic.topicId)} />
+                      <RecoveryItemInfo>
+                        <RecoveryItemName>{topic.name || topic.topicId}</RecoveryItemName>
+                        <RecoveryItemMeta>
+                          {text.recovery.deletedAt} {dayjs(topic.deletedAt).format('MM-DD HH:mm')}
+                          {' · '}
+                          {text.recovery.createdAt} {dayjs(topic.createdAt).format('YYYY-MM-DD')}
+                          {' · '}
+                          {text.recovery.revision} {topic.revision}
+                        </RecoveryItemMeta>
+                      </RecoveryItemInfo>
+                    </RecoveryItem>
+                  ))}
+                </div>
+              ))}
+            </RecoveryList>
+          </>
+        )}
+
+        {restoreResult && (
+          <Alert
+            type={restoreResult.failed === 0 ? 'success' : restoreResult.applied > 0 ? 'warning' : 'error'}
+            showIcon
+            message={
+              restoreResult.failed === 0
+                ? text.recovery.resultSuccess(restoreResult.applied, restoreResult.total)
+                : restoreResult.applied > 0
+                  ? text.recovery.resultPartial(restoreResult.applied, restoreResult.failed)
+                  : text.recovery.resultFailed
+            }
+            closable
+            style={{ marginTop: 6 }}
+          />
+        )}
       </Section>
 
       <SettingDivider />
