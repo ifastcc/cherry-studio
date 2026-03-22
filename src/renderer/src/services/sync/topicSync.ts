@@ -15,6 +15,8 @@ import { loggerService } from '@logger'
 import db from '@renderer/databases'
 import store from '@renderer/store'
 import { updateAssistants } from '@renderer/store/assistants'
+import { removeManyBlocks, upsertManyBlocks } from '@renderer/store/messageBlock'
+import { newMessagesActions } from '@renderer/store/newMessage'
 import type { Topic } from '@renderer/types'
 import type { Message as NewMessage, MessageBlock } from '@renderer/types/newMessage'
 import { AssistantMessageStatus, MessageBlockStatus, UserMessageStatus } from '@renderer/types/newMessage'
@@ -1367,6 +1369,30 @@ async function applyUpsertToDb(topicId: string, messages: NewMessage[], blocks: 
   })
 }
 
+function applyUpsertToRedux(topicId: string, messages: NewMessage[], blocks: MessageBlock[]): void {
+  const state = store.getState()
+  const existingMessageIds = state.messages.messageIdsByTopic[topicId] || []
+  const existingBlockIds = new Set<string>()
+
+  for (const messageId of existingMessageIds) {
+    const message = state.messages.entities[messageId]
+    for (const blockId of message?.blocks || []) {
+      if (blockId) existingBlockIds.add(String(blockId))
+    }
+  }
+
+  const nextBlockIds = new Set(blocks.map((block) => String(block.id)))
+  const staleBlockIds = [...existingBlockIds].filter((id) => !nextBlockIds.has(id))
+
+  if (blocks.length > 0) {
+    store.dispatch(upsertManyBlocks(blocks))
+  }
+  if (staleBlockIds.length > 0) {
+    store.dispatch(removeManyBlocks(staleBlockIds))
+  }
+  store.dispatch(newMessagesActions.syncTopicMessages({ topicId, messages }))
+}
+
 async function applyDeleteToDb(topicId: string): Promise<void> {
   await db.transaction('rw', db.topics, db.message_blocks, async () => {
     const oldTopic = await db.topics.get(topicId)
@@ -1722,6 +1748,7 @@ async function syncOnce(): Promise<void> {
 
         const normalized = normalizeIncomingTopic(topicData, resolvedAssistant.assistantId)
         await applyUpsertToDb(topicId, normalized.messages, normalized.blocks)
+        applyUpsertToRedux(topicId, normalized.messages, normalized.blocks)
 
         if (upsertTopicMetaInAssistants(assistants, resolvedAssistant.assistantId, normalized.topicMeta)) {
           assistantsChanged = true
@@ -2479,6 +2506,7 @@ async function start() {
 
         const normalized = normalizeIncomingTopic(topicData, resolvedAssistant.assistantId)
         await applyUpsertToDb(topicId, normalized.messages, normalized.blocks)
+        applyUpsertToRedux(topicId, normalized.messages, normalized.blocks)
 
         if (upsertTopicMetaInAssistants(assistants, resolvedAssistant.assistantId, normalized.topicMeta)) {
           assistantsChanged = true

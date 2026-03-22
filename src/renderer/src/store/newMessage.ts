@@ -125,6 +125,18 @@ export const messagesSlice = createSlice({
       state.messageIdsByTopic[topicId] = messages.map((m) => m.id)
       state.currentTopicId = topicId
     },
+    syncTopicMessages(state, action: PayloadAction<MessagesReceivedPayload>) {
+      const { topicId, messages } = action.payload
+      const nextIds = new Set(messages.map((m) => m.id))
+      const prevIds = state.messageIdsByTopic[topicId] || []
+      const staleIds = prevIds.filter((id) => !nextIds.has(id))
+      if (staleIds.length > 0) {
+        messagesAdapter.removeMany(state, staleIds)
+      }
+      // @ts-ignore ts-2589 false positive
+      messagesAdapter.upsertMany(state, messages)
+      state.messageIdsByTopic[topicId] = messages.map((m) => m.id)
+    },
     addMessage(state, action: PayloadAction<{ topicId: string; message: Message }>) {
       const { topicId, message } = action.payload
       messagesAdapter.addOne(state, message)
