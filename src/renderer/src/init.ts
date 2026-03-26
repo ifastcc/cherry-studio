@@ -13,7 +13,7 @@ loggerService.initWindowSource('mainWindow')
 
 function initKeyv() {
   window.keyv = new KeyvStorage()
-  window.keyv.init()
+  void window.keyv.init()
 }
 
 function initAutoSync() {
@@ -24,7 +24,7 @@ function initAutoSync() {
       startAutoSync()
     }
     if (nutstoreAutoSync) {
-      startNutstoreAutoSync()
+      void startNutstoreAutoSync()
     }
   }, 8000)
 }
