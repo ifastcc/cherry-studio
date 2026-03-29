@@ -100,7 +100,8 @@ jobs:
           set -euo pipefail
 
           declare -a FORK_OWNED_PATHS=(
-            .github/workflows
+            .github/workflows/auto-sync-release.yml
+            .github/workflows/my-custom-release.yml
             electron-builder.yml
             src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
             src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
@@ -148,9 +149,9 @@ jobs:
               fi
             done <<< "$UNMERGED_CONFLICTS"
 
-            git checkout --ours -- "${FORK_OWNED_PATHS[@]}"
-            git add "${FORK_OWNED_PATHS[@]}"
-            git restore --source=HEAD --staged --worktree "${FORK_OWNED_PATHS[@]}"
+            # Restore fork-owned files directly from HEAD so modify/delete
+            # conflicts are resolved even when there is no "ours" stage entry.
+            git restore --source=HEAD --staged --worktree -- "${FORK_OWNED_PATHS[@]}"
 
             REMAINING_CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
             if [ -n "$REMAINING_CONFLICTS" ]; then
