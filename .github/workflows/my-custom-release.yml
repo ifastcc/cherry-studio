@@ -100,8 +100,6 @@ jobs:
           set -euo pipefail
 
           declare -a FORK_OWNED_PATHS=(
-            .github/workflows/auto-sync-release.yml
-            .github/workflows/my-custom-release.yml
             electron-builder.yml
             src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
             src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
@@ -140,6 +138,7 @@ jobs:
           fi
 
           if [ "$MERGE_STARTED" = "true" ]; then
+            mapfile -t HEAD_WORKFLOW_FILES < <(git ls-tree -r --name-only HEAD .github/workflows)
             UNMERGED_CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
             while IFS= read -r conflict_file; do
               [ -z "$conflict_file" ] && continue
@@ -148,6 +147,19 @@ jobs:
                 echo "Dropped upstream-only conflict path ${conflict_file}."
               fi
             done <<< "$UNMERGED_CONFLICTS"
+
+            # The GitHub Actions token cannot push workflow file changes, so
+            # restore existing fork workflows and remove any upstream-only ones.
+            if [ "${#HEAD_WORKFLOW_FILES[@]}" -gt 0 ]; then
+              git restore --source=HEAD --staged --worktree -- "${HEAD_WORKFLOW_FILES[@]}"
+            fi
+
+            mapfile -t CURRENT_WORKFLOW_FILES < <(git ls-files .github/workflows)
+            for workflow_file in "${CURRENT_WORKFLOW_FILES[@]}"; do
+              if ! git cat-file -e "HEAD:${workflow_file}" 2>/dev/null; then
+                git rm -f --ignore-unmatch -- "$workflow_file"
+              fi
+            done
 
             # Restore fork-owned files directly from HEAD so modify/delete
             # conflicts are resolved even when there is no "ours" stage entry.
