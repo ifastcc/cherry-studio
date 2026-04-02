@@ -9,7 +9,7 @@ import { errorHandler } from './middleware/error'
 import { setupOpenAPIDocumentation } from './middleware/openapi'
 import { agentsRoutes } from './routes/agents'
 import { chatRoutes } from './routes/chat'
-import { historyRoutes } from './routes/history'
+import { knowledgeRoutes } from './routes/knowledge'
 import { mcpRoutes } from './routes/mcp'
 import { messagesProviderRoutes, messagesRoutes } from './routes/messages'
 import { modelsRoutes } from './routes/models'
@@ -52,7 +52,7 @@ app.use((_req, res, next) => {
 app.use(
   cors({
     origin: '*',
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
   })
 )
@@ -127,22 +127,15 @@ app.get('/', (_req, res) => {
       chat_completions: 'POST /v1/chat/completions',
       models: 'GET /v1/models',
       messages: 'POST /v1/messages',
-      history_topics: 'GET /v1/history/topics',
-      history_topic: 'GET /v1/history/topics/:topicId',
-      history_topic_messages: 'GET /v1/history/topics/:topicId/messages',
-      history_transcript: 'GET /v1/history/topics/:topicId/transcript',
-      history_messages: 'GET /v1/history/messages',
-      history_message_batch: 'POST /v1/history/messages/batch',
-      history_message: 'GET /v1/history/messages/:messageId',
-      history_message_context: 'GET /v1/history/messages/:messageId/context',
-      history_search: 'GET /v1/history/search/messages',
       messages_provider: 'POST /:provider/v1/messages',
       mcps: 'GET /v1/mcps',
       mcp_server: 'GET /v1/mcps/:server_id',
       mcp_proxy: 'ALL /v1/mcps/:server_id/mcp',
       agents: 'GET /v1/agents',
       agent_sessions: 'GET /v1/agents/:agentId/sessions',
-      session_messages: 'GET /v1/agents/:agentId/sessions/:sessionId/messages'
+      session_messages: 'GET /v1/agents/:agentId/sessions/:sessionId/messages',
+      knowledge_bases: 'GET /v1/knowledge-bases',
+      knowledge_search: 'POST /v1/knowledge-bases/search'
     }
   })
 })
@@ -162,7 +155,7 @@ apiRouter.use('/mcps', mcpRoutes)
 apiRouter.use('/messages', extendMessagesTimeout, messagesRoutes)
 apiRouter.use('/models', modelsRoutes)
 apiRouter.use('/agents', agentsRoutes)
-apiRouter.use('/history', historyRoutes)
+apiRouter.use('/knowledge-bases', knowledgeRoutes)
 app.use('/v1', apiRouter)
 
 // Error handling (must be last)
