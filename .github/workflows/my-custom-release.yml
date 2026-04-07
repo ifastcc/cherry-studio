@@ -28,7 +28,6 @@ concurrency:
 
 env:
   UPSTREAM_REPO: CherryHQ/cherry-studio
-  NODE_VERSION: "22"
   ELECTRON_OFFICIAL_MIRROR: https://github.com/electron/electron/releases/download/
 
 jobs:
@@ -101,6 +100,7 @@ jobs:
 
           declare -a FORK_OWNED_PATHS=(
             electron-builder.yml
+            scripts/ci/install-linux-build-deps.sh
             src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
             src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
             src/renderer/src/pages/settings/DataSettings/TopicSyncText.ts
@@ -217,7 +217,7 @@ jobs:
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 10.27.0
           run_install: false
@@ -225,7 +225,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: '.node-version'
           cache: pnpm
 
       - name: Configure CI download mirrors
@@ -337,7 +337,7 @@ jobs:
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 10.27.0
           run_install: false
@@ -345,7 +345,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: '.node-version'
           cache: pnpm
 
       - name: Configure CI download mirrors
@@ -445,7 +445,7 @@ jobs:
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           version: 10.27.0
           run_install: false
@@ -453,7 +453,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version-file: '.node-version'
           cache: pnpm
 
       - name: Configure CI download mirrors
@@ -472,8 +472,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y rpm
+          bash scripts/ci/install-linux-build-deps.sh
           pnpm build:linux --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
