@@ -101,6 +101,7 @@ jobs:
           declare -a FORK_OWNED_PATHS=(
             electron-builder.yml
             scripts/ci/install-linux-build-deps.sh
+            scripts/ci/run-with-retry.sh
             src/renderer/src/pages/settings/DataSettings/DataSettings.tsx
             src/renderer/src/pages/settings/DataSettings/TopicSyncSettings.tsx
             src/renderer/src/pages/settings/DataSettings/TopicSyncText.ts
@@ -234,6 +235,16 @@ jobs:
           set -euo pipefail
           perl -0pi -e 's#mirror:\s*https://npmmirror\.com/mirrors/electron/#mirror: '"${ELECTRON_OFFICIAL_MIRROR}"'#g' electron-builder.yml
 
+      - name: Cache Electron builder downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: ${{ runner.os }}-electron-builder-${{ hashFiles('electron-builder.yml', 'package.json', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-electron-builder-
+
       - name: Install dependencies
         shell: bash
         run: |
@@ -251,7 +262,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pnpm build:mac --publish never
+          bash scripts/ci/run-with-retry.sh --attempts 3 --delay 20 -- pnpm build:mac --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
