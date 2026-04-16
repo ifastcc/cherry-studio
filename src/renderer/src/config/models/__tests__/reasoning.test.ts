@@ -2653,6 +2653,44 @@ describe('Kimi Models', () => {
   })
 })
 
+describe('isSupportedThinkingTokenZhipuModel', () => {
+  it('matches GLM-5 series (with or without hyphen)', () => {
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm5' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-5' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-5-plus' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'GLM-5-Pro' }))).toBe(true)
+  })
+
+  it('matches GLM-4.5 / 4.6 / 4.7 series', () => {
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4.5' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4.6' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4.7' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4.6-pro' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4.5-flash' }))).toBe(true)
+  })
+
+  it('rejects GLM-4 base and GLM-Z1 models', () => {
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4' }))).toBe(false)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4-plus' }))).toBe(false)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4.0' }))).toBe(false)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-4.3' }))).toBe(false)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-z1' }))).toBe(false)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'glm-z1-plus' }))).toBe(false)
+  })
+
+  it('rejects unrelated model IDs', () => {
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'gpt-4o' }))).toBe(false)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'claude-3.5-sonnet' }))).toBe(false)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'deepseek-v3' }))).toBe(false)
+  })
+
+  it('handles provider-prefixed model IDs', () => {
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'accounts/fireworks/models/glm-4p7' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'accounts/fireworks/models/glm-4p5' }))).toBe(true)
+    expect(isSupportedThinkingTokenZhipuModel(createModel({ id: 'zhipu/glm-4.6' }))).toBe(true)
+  })
+})
+
 describe('Fireworks provider model name normalization', () => {
   it('should detect DeepSeek hybrid inference models from Fireworks', () => {
     expect(isDeepSeekHybridInferenceModel(createModel({ id: 'accounts/fireworks/models/deepseek-v3p2' }))).toBe(true)
@@ -2731,5 +2769,72 @@ describe('Doubao Seed 2.0 Models', () => {
       group: 'Doubao-Seed-2.0'
     }
     expect(isDoubaoSeedAfter251015(model)).toBe(true)
+  })
+})
+
+describe('Gemma 4 Models', () => {
+  describe('isReasoningModel', () => {
+    it('detects Gemma 4 GenAI format as reasoning', () => {
+      expect(isReasoningModel(createModel({ id: 'gemma-4-e2b' }))).toBe(true)
+      expect(isReasoningModel(createModel({ id: 'gemma-4-e4b' }))).toBe(true)
+      expect(isReasoningModel(createModel({ id: 'gemma-4-26b-moe' }))).toBe(true)
+      expect(isReasoningModel(createModel({ id: 'gemma-4-31b' }))).toBe(true)
+    })
+
+    it('detects Gemma 4 Ollama format as reasoning', () => {
+      expect(isReasoningModel(createModel({ id: 'gemma4' }))).toBe(true)
+      expect(isReasoningModel(createModel({ id: 'gemma4:e2b' }))).toBe(true)
+      expect(isReasoningModel(createModel({ id: 'gemma4:31b' }))).toBe(true)
+      expect(isReasoningModel(createModel({ id: 'gemma4:latest' }))).toBe(true)
+    })
+
+    it('does NOT detect Gemma 2 as reasoning (no regression)', () => {
+      expect(isReasoningModel(createModel({ id: 'gemma-2b' }))).toBe(false)
+      expect(isReasoningModel(createModel({ id: 'gemma-2-27b-it' }))).toBe(false)
+    })
+
+    it('does NOT detect Gemma 3 as reasoning (no regression)', () => {
+      expect(isReasoningModel(createModel({ id: 'gemma-3-27b' }))).toBe(false)
+      expect(isReasoningModel(createModel({ id: 'gemma-3n-e4b-it' }))).toBe(false)
+    })
+  })
+
+  describe('findTokenLimit', () => {
+    it('returns correct limits for Gemma 4 E2B/E4B (GenAI)', () => {
+      expect(findTokenLimit('gemma-4-e2b')).toEqual({ min: 1024, max: 8192 })
+      expect(findTokenLimit('gemma-4-e4b')).toEqual({ min: 1024, max: 8192 })
+    })
+
+    it('returns correct limits for Gemma 4 26B MoE (GenAI)', () => {
+      expect(findTokenLimit('gemma-4-26b-moe')).toEqual({ min: 1024, max: 30720 })
+    })
+
+    it('returns correct limits for Gemma 4 31B (GenAI)', () => {
+      expect(findTokenLimit('gemma-4-31b')).toEqual({ min: 1024, max: 30720 })
+    })
+
+    it('returns correct limits for Gemma 4 Ollama tags', () => {
+      expect(findTokenLimit('gemma4:e2b')).toEqual({ min: 1024, max: 8192 })
+      expect(findTokenLimit('gemma4:e4b')).toEqual({ min: 1024, max: 8192 })
+      expect(findTokenLimit('gemma4:26b')).toEqual({ min: 1024, max: 30720 })
+      expect(findTokenLimit('gemma4:31b')).toEqual({ min: 1024, max: 30720 })
+    })
+
+    it('returns correct limits for Gemma 4 with -it suffix', () => {
+      expect(findTokenLimit('gemma-4-e2b-it')).toEqual({ min: 1024, max: 8192 })
+      expect(findTokenLimit('gemma-4-e4b-it')).toEqual({ min: 1024, max: 8192 })
+      expect(findTokenLimit('gemma4:e2b-it')).toEqual({ min: 1024, max: 8192 })
+      expect(findTokenLimit('gemma-4-26b-it')).toEqual({ min: 1024, max: 30720 })
+      expect(findTokenLimit('gemma-4-31b-it')).toEqual({ min: 1024, max: 30720 })
+    })
+
+    it('returns undefined for bare gemma4 without variant tag', () => {
+      expect(findTokenLimit('gemma4')).toBeUndefined()
+      expect(findTokenLimit('gemma4:latest')).toBeUndefined()
+    })
+
+    it('still returns correct limits for earlier Gemma reasoning models', () => {
+      expect(findTokenLimit('gemma-3-27b')).toBeUndefined()
+    })
   })
 })
